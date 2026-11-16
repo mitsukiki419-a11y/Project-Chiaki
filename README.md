@@ -99,7 +99,7 @@ C:\Project Chiaki\
 
 ## Android
 
-Needs a 64-bit Android phone or tablet, Android 7 or newer. The emulator is demanding: use a **mid-range phone
+Needs Android 7 or newer (64-bit or 32-bit). The emulator is demanding: use a **mid-range phone
 from about 2021 or newer** (Snapdragon 7/8-series, Dimensity 900+, Galaxy A54 or better). On entry-level phones
 (for example the Galaxy A03) the music plays slowly; use **Smart link** with your PC instead (below).
 It also runs on PC Android emulators such as **LDPlayer 9** (64-bit).
@@ -126,13 +126,14 @@ With the phone's file manager, or from a PC over USB (choose **File transfer** o
 | one **small** SoundFont (for example a 10–20 MB one; big ones of hundreds of MB don't fit in a phone's memory) | `Project Chiaki/Soundfont` |
 | ffmpeg (see below) | `Project Chiaki` itself, next to the `BIOS` folder |
 
-**ffmpeg for Android:** download the static Linux build from **https://johnvansickle.com/ffmpeg/**:
-- for a **phone or tablet**: the **arm64** build; put the file `ffmpeg` from it in the folder as **`ffmpeg`**
-- for **LDPlayer / PC Android emulators**: the **amd64** build; put its `ffmpeg` in the folder renamed to
-  **`ffmpeg-x86_64`**
+**ffmpeg for Android:** use the Android ffmpeg from this project's **Releases** page
+(`ffmpeg-android-arm64` for phones and tablets, `ffmpeg-android-x86_64` for LDPlayer / PC Android emulators) and
+put it in the `Project Chiaki` folder (any name starting with `ffmpeg` works). Ordinary Linux builds (for example
+from johnvansickle.com) and the Windows `ffmpeg.exe` do **not** run on Android: Android blocks them. Without ffmpeg
+the app plays songs, but shows no pictures or video; ⚙ Settings says why if it can't use the file.
 
-Not the Windows `ffmpeg.exe`: that one does not run on Android. Without ffmpeg the app plays songs, but shows no
-pictures or video.
+These Android builds are FFmpeg 6.1.1 (LGPL), built statically with musl; source:
+https://ffmpeg.org/releases/ffmpeg-6.1.1.tar.xz (the build options are in `android/FFMPEG_BUILD.md`).
 
 ### 4. Play
 Tap **▶ Play on this phone**, open **⚙ Settings**, choose the firmware and disc and press **⏻**.
@@ -239,6 +240,18 @@ inside the exe). Run without building: `python karaoke_emu.py`.
 **Android app:** install Android Studio once (start it and finish its setup), then run
 **`android\build_apk.bat`** → `android\Project Chiaki.apk`. It sets up Java 21 and Python 3.11 by itself if they
 are missing. See `android/README_ANDROID.md`.
+
+---
+
+## Third-party software: ffmpeg
+
+ffmpeg is **not** part of Project Chiaki. It is FFmpeg (https://ffmpeg.org), a separate program licensed under the
+LGPL / GPL. The ffmpeg files offered on this project's Releases page are unmodified FFmpeg:
+
+- **Android** (`ffmpeg-android-arm64`, `ffmpeg-android-x86_64`): FFmpeg 6.1.1, LGPL 2.1, built statically with
+  musl. Source: https://ffmpeg.org/releases/ffmpeg-6.1.1.tar.xz. Build options: `android/FFMPEG_BUILD.md`.
+- **Windows** (`ffmpeg.exe`): the "release essentials" build from https://www.gyan.dev/ffmpeg/builds/ (GPL);
+  its source is linked on that page and at https://ffmpeg.org/download.html.
 
 ---
 
