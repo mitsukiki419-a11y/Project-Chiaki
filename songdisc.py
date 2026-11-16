@@ -517,11 +517,32 @@ class KaraokeDisc:
         if not struct.unpack_from('<I', rec, 12)[0]: return []
         return [d for _, _, _, d in karamidi.record_parts(rec)]
 
-    def extract(self, song, folder, wav=True):
-        """Write <number> <title>.mid and the chorus clips (.wma, and .wav when ffmpeg is available)."""
+    def extract(self, song, folder, wav=True, only=None):
+        """Write <number> <title>.mid and the chorus clips (.wma, and .wav when ffmpeg is available).
+        only='midi': just the .mid (a music video: its lyrics .mid, when it has one);
+        only='mp3': just the song's recorded audio (the chorus clips) as .mp3 (needs ffmpeg)."""
         os.makedirs(folder, exist_ok=True)
         base = '%06d %s' % (song.number, _safe(song.title + (' - ' + song.artist if song.artist else '')))
         out = []
+        if only == 'midi':
+            m = self.midi(song)
+            if song.is_mv and not (m and karamidi.midi_ok(m)): return out
+            p = os.path.join(folder, base + (' lyrics' if song.is_mv else '') + '.mid'); open(p, 'wb').write(m); out.append(p)
+            return out
+        if only == 'mp3':
+            if song.is_mv: return out
+            clips = self.chorus(song)
+            if not clips: return out
+            ff = isoread.find_ffmpeg()
+            if not ff: raise RuntimeError('ffmpeg is needed to make MP3 files (put ffmpeg.exe next to the program)')
+            for i, w in enumerate(clips, 1):
+                suffix = ' chorus' + (' %d' % i if len(clips) > 1 else '')
+                p = os.path.join(folder, base + suffix + '.mp3')
+                r = subprocess.run([ff, '-v', 'error', '-y', '-i', 'pipe:0', '-vn', '-c:a', 'libmp3lame', '-q:a', '2', p],
+                                   input=w, capture_output=True, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+                if r.returncode == 0: out.append(p)
+                else: raise RuntimeError('MP3 conversion failed: ' + r.stderr.decode('utf-8', 'replace')[-200:])
+            return out
         if song.is_mv:
             return self.extract_mv(song, folder, base)
         p = os.path.join(folder, base + '.mid'); open(p, 'wb').write(self.midi(song)); out.append(p)

@@ -30,6 +30,7 @@ def _load_biquad():
     dirs = [os.path.dirname(os.path.abspath(__file__))]
     if getattr(sys, '_MEIPASS', None): dirs.insert(0, sys._MEIPASS)
     if getattr(sys, 'frozen', False): dirs.append(os.path.dirname(sys.executable))
+    if os.environ.get('KE_LIBDIR'): dirs.insert(0, os.environ['KE_LIBDIR'])      # Android: the app's library folder
     for d in dirs:
         for n in names:
             try:
@@ -48,6 +49,7 @@ def _load_voice():
     dirs = [os.path.dirname(os.path.abspath(__file__))]
     if getattr(sys, '_MEIPASS', None): dirs.insert(0, sys._MEIPASS)
     if getattr(sys, 'frozen', False): dirs.append(os.path.dirname(sys.executable))
+    if os.environ.get('KE_LIBDIR'): dirs.insert(0, os.environ['KE_LIBDIR'])
     for d in dirs:
         for n in names:
             try:
@@ -62,6 +64,8 @@ def _load_voice():
 
 
 def _synth_process(conn, sf_path, wav_path=None, log_path=None):
+    global LOG_PATH
+    if log_path: LOG_PATH = log_path                 # (a new process: the parent's setting is not inherited)
     try:
         _synth_main(conn, sf_path, wav_path)
     except (KeyboardInterrupt, SystemExit, EOFError, BrokenPipeError):
@@ -90,7 +94,7 @@ def _synth_main(conn, sf_path, wav_path=None):
     import ctypes
     biquad = None if os.environ.get('KE_NOFILTER') else _load_biquad()
     cvoice = None if os.environ.get('KE_PYSYNTH') else _load_voice()     # whole voices in C: ~20x faster
-    out_dev = _WaveOut() if sys.platform == 'win32' and not wav_path else None
+    out_dev = (_WaveOut() if sys.platform == 'win32' else _AndroidOut() if ANDROID else None) if not wav_path else None
     wav = open(wav_path, 'wb') if wav_path else None
     if wav: wav.write(b'\0' * 44)
     chans = None
@@ -105,7 +109,8 @@ def _synth_main(conn, sf_path, wav_path=None):
 
     def start_note(c, key, vel):
         C = chans[c]
-        pk = key if C['drum'] else min(127, max(0, key + int(ctl['transpose'])))     # the key that sounds
+        pk = key if C['drum'] else min(127, max(0, key + int(ctl['transpose']) + int(ctl['fw_key']))) # the key that sounds
+        # (fw_key: the player's own Key setting where its DSP is the synthesizer - KS5)
         ov = ctl['prog'][c] if c < len(ctl['prog']) else -1                           # instrument chosen in the panel
         bank, prog = (ov // 128, ov % 128) if ov is not None and ov >= 0 else (C['bank'], C['prog'])
         nv0 = len(voices)
@@ -194,10 +199,15 @@ def _synth_main(conn, sf_path, wav_path=None):
             if kill: voices.remove(v)
             elif v['rel_t'] is None: v['on'] = False; v['rel_t'] = v['t']; v['rel_lvl'] = v['lvl']
 
-    master = [1.0]
+    master = [1.0]; vol_seen = [False]
     # the synthesizer controller (the page's Synth panel): master volume, per-channel volume / mute, transpose,
     # filter on/off
-    ctl = dict(master=1.0, mute=[False] * 16, chvol=[1.0] * 16, transpose=0, filter=True, prog=[-1] * 16, pcm=1.0)
+    ctl = dict(master=1.0, mute=[False] * 16, chvol=[1.0] * 16, transpose=0, filter=True, prog=[-1] * 16, pcm=1.0,
+               reverb=0.0, eq=[0.0, 0.0, 0.0], melody=True, fw_key=0, fw_melody=True,
+               mic=False, mic_dev=-1, mic_vol=1.0, echo=0.3, echo_ms=120)
+    melody = _Melody()
+    fx = _MusicFX(biquad)
+    mic = [None, None]               # the open microphone, and the (device) it was opened for
 
     def sysex(m):
         nonlocal chans
@@ -223,8 +233,8 @@ def _synth_main(conn, sf_path, wav_path=None):
         if st < 0x80 or st > 0xF0: return
         kind = st & 0xF0; c = st & 15; a = m[1] if len(m) > 1 else 0; b = m[2] if len(m) > 2 else 0
         C = chans[c]
-        if kind == 0x90 and b: start_note(c, a, b)
-        elif kind == 0x80 or kind == 0x90: note_off(c, a)
+        if kind == 0x90 and b: start_note(c, a, b); melody.note(c, a, clock, C['drum'])
+        elif kind == 0x80 or kind == 0x90: note_off(c, a); melody.off(c, a)
         elif kind == 0xB0:
             if a == 0: C['bank'] = 128 if C['drum'] else b
             elif a == 1: C['mod'] = b
@@ -237,8 +247,12 @@ def _synth_main(conn, sf_path, wav_path=None):
             elif a == 6:                                                # data entry
                 r = C['rpn']
                 if isinstance(r, list) and r == [0, 0]: C['brange'] = min(b, 24)        # pitch bend sensitivity
-                # (NRPN 37xx are the SAM2695's microphone/echo settings - the player's Vol keys change 37 07 -
-                # not the music; they are left alone)
+                # NRPN 37xx: the SAM2695's master settings. 37 07 is the music volume the player's Vol keys set
+                # (MP100: 12 steps, 0x00, 0x09, 0x13 ... 0x6D). 0 is also what a fresh player sends before anyone
+                # touched the volume, so 0 counts only once a real level has been seen (else: full volume).
+                elif isinstance(r, tuple) and r == (0x37, 0x07):
+                    if b or vol_seen[0]:
+                        master[0] = min(1.0, b / 109.0) ** 1.5; vol_seen[0] = True
             elif a == 7: C['vol'] = b
             elif a == 11: C['expr'] = b
             elif a == 10: C['pan'] = b
@@ -276,7 +290,7 @@ def _synth_main(conn, sf_path, wav_path=None):
             cents = (v['vib'] + C['mod'] * 50 / 127.0) * lfo_v + v['mlp'] * lfo_m + v['me_p'] * me
             step = v['base_step'] * 2.0 ** (C['bend'] / 8192 * C['brange'] / 12.0 + cents / 1200.0)
             amp = v['atten'] * (v['vel'] / 127.0) ** 2 * (C['vol'] / 127.0) ** 2 * (C['expr'] / 127.0) ** 2
-            amp *= 0.0 if ctl['mute'][v['ch']] else ctl['chvol'][v['ch']]
+            amp *= 0.0 if (ctl['mute'][v['ch']] or (not (ctl['melody'] and ctl['fw_melody']) and v['ch'] in melody.chans)) else ctl['chvol'][v['ch']]
             pan = min(max((C['pan'] - 64) / 64.0 + v['pan_off'], -1), 1)
             f_on = 0.0; cf = (0.0, 0.0, 0.0, 0.0, 0.0)
             if v['filt'] and ctl['filter'] and not light[0]:
@@ -339,7 +353,7 @@ def _synth_main(conn, sf_path, wav_path=None):
                 if env[-1] <= 0: dead.append(v)
             env = env.astype(np.float32)
             amp = v['atten'] * (v['vel'] / 127.0) ** 2 * (C['vol'] / 127.0) ** 2 * (C['expr'] / 127.0) ** 2
-            amp *= 0.0 if ctl['mute'][v['ch']] else ctl['chvol'][v['ch']]
+            amp *= 0.0 if (ctl['mute'][v['ch']] or (not (ctl['melody'] and ctl['fw_melody']) and v['ch'] in melody.chans)) else ctl['chvol'][v['ch']]
             pan = min(max((C['pan'] - 64) / 64.0 + v['pan_off'], -1), 1)
             sig = wave * env * amp
             if v['filt'] and ctl['filter'] and not light[0] and n:
@@ -380,7 +394,9 @@ def _synth_main(conn, sf_path, wav_path=None):
         order[0] += 1; sched.append((due, order[0], m))
 
     streams = []                                     # recorded audio (song chorus clips) being mixed in
+    shift = _PitchShift(RATE)
     def mix_streams(out, clk0):
+        sbuf = np.zeros_like(out) if shift.active(ctl['fw_key']) else None
         g = 0.8 * ctl['pcm'] * ctl['master']
         done = []
         for k, st_ in enumerate(streams):
@@ -392,10 +408,12 @@ def _synth_main(conn, sf_path, wav_path=None):
                 if st_.get('sid') is None or clk0 - (st_['due'] + len(a)) > 2 * RATE: done.append(k)
                 continue
             n = min(clk0 + BLOCK - start, len(a) - src)
-            out[start - clk0:start - clk0 + n] += a[src:src + n] * g
+            dst = sbuf if shift.active(ctl['fw_key']) else out
+            dst[start - clk0:start - clk0 + n] += a[src:src + n] * g
         # (by position: list.remove compares the dicts, and so their sample arrays, which raised an error and
         # stopped the whole synth as soon as two clips of different lengths were playing)
         for k in reversed(done): del streams[k]
+        if sbuf is not None: out += shift.run(sbuf, ctl['fw_key'])
 
     def render_block():
         nonlocal clock
@@ -408,7 +426,15 @@ def _synth_main(conn, sf_path, wav_path=None):
             if nxt: out[done:done + nxt] = render_part(nxt); done += nxt; clock += nxt
             while sched and sched[0][0] <= clock: handle(sched.pop(0)[2])
             if done >= BLOCK: break
+        fx.run(out, ctl)                                      # reverb / equalizer on the music
         if streams: mix_streams(out, clk0)
+        if ctl['mic'] and out_dev is not None:
+            if mic[1] != ctl['mic_dev'] or mic[0] is None:
+                if mic[0] is not None: mic[0].close()
+                mic[0] = _open_mic(ctl['mic_dev']); mic[1] = ctl['mic_dev']
+            if mic[0] is not None: mic[0].mix(out, ctl)
+        elif mic[0] is not None:
+            mic[0].close(); mic[0] = None; mic[1] = None
         return (np.clip(out, -1, 1) * 32767).astype('<i2').tobytes()
 
     conn.send(('ready', sf.name))
@@ -426,6 +452,14 @@ def _synth_main(conn, sf_path, wav_path=None):
                 ts, raw = m[0], m[1]; sid = m[2] if len(m) > 2 else None
                 a = np.frombuffer(raw, dtype='<i2').astype(np.float32).reshape(-1, 2) / 32768.0
                 due = (int(ts * RATE) + offset[0]) if (ts is not None and offset[0] is not None) else clock + LATENCY
+                if ts is not None and offset[0] is not None and abs(due - (clock + LATENCY)) > int(0.5 * RATE) and not any(
+                        x.get('sid') == sid for x in streams):
+                    # the clocks were last locked by MIDI long ago (at power-on, when the player ran at another
+                    # speed): a new recorded sound would wait seconds or never come - or, the player having fallen
+                    # behind since, come "too late" and be skipped whole (the KS5's spoken numbers before the first
+                    # song: heard only after a song had played and its MIDI re-locked the clocks). It re-locks the
+                    # clocks, as a late or early MIDI message does
+                    offset[0] = clock + LATENCY - int(ts * RATE); due = clock + LATENCY
                 if sid is not None:
                     # a piece of a stream already known: straight after its previous piece, whatever its time
                     # stamp says (timing jitter left sample gaps / overlaps there: crackle). A stream that ran dry
@@ -440,10 +474,12 @@ def _synth_main(conn, sf_path, wav_path=None):
                             continue
                         del streams[next(i for i, x in enumerate(streams) if x is st_)]; due = max(due, clock + 64)
                         n = min(len(a), 96); a = a.copy(); a[:n] *= np.linspace(0.0, 1.0, n, dtype=np.float32)[:, None]
-                    elif due < clock:
-                        cut = clock - due                               # first piece late: skip what is past
+                    elif due < clock - int(0.4 * RATE):
+                        cut = clock - due                               # first piece clearly late: skip what is past
                         if cut >= len(a): continue
                         a = a[cut:]; due = clock
+                    elif due < clock:
+                        due = clock          # a little late (a decoder starting): play it all from now, not cut short
                     streams.append(dict(due=due, a=a, sid=sid))
                     continue
                 # a piece that continues a stream still playing (streamed sound comes in 20 ms pieces) is joined to
@@ -483,12 +519,282 @@ def _synth_main(conn, sf_path, wav_path=None):
             if d > 0: time.sleep(d)
 
 
+
+class _PitchShift:
+    """The player's Key setting on recorded music (KS5 MP3 songs: its DSP shifts the song's pitch, keeping the
+    tempo). Two read heads sweep a short delay line at the new speed, each faded in and out (sin^2) half a window
+    apart, the way karaoke DSPs do it."""
+    W = 1600                                            # window: 50 ms at 32 kHz
+    N = 8192
+    def __init__(self, rate):
+        import numpy as np
+        self.buf = np.zeros((self.N, 2), np.float32); self.w = 0; self.ph = 0.0; self.key = 0
+    def active(self, key):
+        return bool(key) or bool(self.key)
+    def run(self, x, key):
+        import numpy as np
+        if key != self.key:
+            self.key = key
+            if not key: self.buf[:] = 0; self.ph = 0.0; return x       # back to the song's own key: straight through
+        n = len(x); N = self.N; W = self.W
+        idx = (self.w + np.arange(n)) % N
+        self.buf[idx] = x
+        r = 2.0 ** (key / 12.0)
+        i = np.arange(n, dtype=np.float64)
+        d1 = np.mod(self.ph - (r - 1.0) * i, W); d2 = np.mod(d1 + W / 2, W)
+        out = np.zeros_like(x)
+        for d in (d1, d2):
+            pos = (self.w + i - d - 2.0) % N
+            p0 = np.floor(pos).astype(np.int64); f = (pos - p0).astype(np.float32)[:, None]
+            s_ = self.buf[p0 % N] * (1 - f) + self.buf[(p0 + 1) % N] * f
+            out += s_ * (np.sin(np.pi * d / W) ** 2).astype(np.float32)[:, None]
+        self.ph = float(np.mod(self.ph - (r - 1.0) * n, W)); self.w = (self.w + n) % N
+        return out
+
+class _Melody:
+    """Which channels carry the song's melody (the guide tune), for the Melody key: of the instruments that play
+    one note at a time in the singing range, the busiest one, and any other that plays the same notes at the same
+    moments (melodies are often doubled). Counted over the last ~200 notes of each channel."""
+    def __init__(self):
+        import collections
+        self.on = [set() for _ in range(16)]; self.n = [0] * 16; self.poly = [0] * 16; self.pitch = [0.0] * 16
+        self.recent = [collections.deque(maxlen=200) for _ in range(16)]; self.chans = set(); self.k = 0
+    def note(self, c, key, t, drum):
+        if drum: return
+        self.on[c].add(key); self.n[c] += 1
+        if len(self.on[c]) > 1: self.poly[c] += 1
+        self.pitch[c] = 0.98 * self.pitch[c] + 0.02 * key if self.pitch[c] else key
+        self.recent[c].append((t, key)); self.k += 1
+        if self.k % 32 == 0: self._pick()
+    def off(self, c, key): self.on[c].discard(key)
+    def _pick(self):
+        cand = [c for c in range(16) if self.n[c] >= 24 and self.poly[c] <= 0.1 * self.n[c] and 52 <= self.pitch[c] <= 86]
+        if not cand: self.chans = set(); return
+        best = max(cand, key=lambda c: len(self.recent[c]))
+        ref = {(t // 800, k % 12) for t, k in self.recent[best]}                # 25 ms slots at 32 kHz
+        same = {best}
+        for c in cand:
+            if c != best and self.recent[c]:
+                hit = sum(1 for t, k in self.recent[c] if (t // 800, k % 12) in ref)
+                if hit >= 0.6 * len(self.recent[c]): same.add(c)
+        self.chans = same
+
+
+class _MusicFX:
+    """Reverb and a three-band equalizer on the music, set from the Synth panel (ctl reverb 0..1, eq [bass, mid,
+    treble] in dB, -12..+12). The reverb: four comb filters and two all-passes (Schroeder), all at least a block
+    long so each block is a few numpy operations."""
+    def __init__(self, biquad):
+        import ctypes
+        self.bq = biquad; self.eq = None; self.coef = []; self.z = []; self.ct = ctypes; self.rv = None
+    def _eq_setup(self, eq):
+        import math
+        self.eq = list(eq); self.coef = []; self.z = []
+        for kind, f, g in (('ls', 200.0, eq[0]), ('pk', 1000.0, eq[1]), ('hs', 4000.0, eq[2])):
+            if abs(g) < 0.1: continue
+            A = 10 ** (g / 40.0); w = 2 * math.pi * f / RATE; cs = math.cos(w); sn = math.sin(w)
+            if kind == 'pk':
+                al = sn / (2 * 0.9)
+                b = (1 + al * A, -2 * cs, 1 - al * A); a = (1 + al / A, -2 * cs, 1 - al / A)
+            else:
+                al = sn / 2 * math.sqrt(2); sq = 2 * math.sqrt(A) * al; sg = 1 if kind == 'ls' else -1
+                b = (A * ((A + 1) - sg * (A - 1) * cs + sq), sg * 2 * A * ((A - 1) - sg * (A + 1) * cs), A * ((A + 1) - sg * (A - 1) * cs - sq))
+                a = ((A + 1) + sg * (A - 1) * cs + sq, -sg * 2 * ((A - 1) + sg * (A + 1) * cs), (A + 1) + sg * (A - 1) * cs - sq)
+            c = (self.ct.c_double * 5)(b[0] / a[0], b[1] / a[0], b[2] / a[0], a[1] / a[0], a[2] / a[0])
+            self.coef.append(c); self.z.append([(self.ct.c_double * 2)(), (self.ct.c_double * 2)()])
+    def run(self, out, ctl):
+        import numpy as np
+        eq = ctl.get('eq') or [0, 0, 0]
+        if self.bq is not None and any(abs(x) >= 0.1 for x in eq):
+            if self.eq != list(eq): self._eq_setup(eq)
+            for ch in (0, 1):
+                x = np.ascontiguousarray(out[:, ch])
+                for c, z in zip(self.coef, self.z): self.bq(x.ctypes.data, len(x), self.ct.addressof(c), self.ct.addressof(z[ch]))
+                out[:, ch] = x
+        r = float(ctl.get('reverb') or 0.0)
+        if r > 0.005:
+            if self.rv is None:
+                k = RATE / 44100.0
+                self.rv = dict(comb=[[np.zeros(max(BLOCK, int(d * k)), np.float32), 0.0] for d in (1557, 1617, 1491, 1422)],
+                               ap=[np.zeros(max(BLOCK, int(d * k)), np.float32) for d in (761, 829)],
+                               ap2=[np.zeros(max(BLOCK, int(d * k)), np.float32) for d in (787, 853)])
+            x = out.mean(axis=1) * 0.25; acc = np.zeros(BLOCK, np.float32); fb = 0.80
+            for cb in self.rv['comb']:
+                buf = cb[0]; old = buf[:BLOCK].copy()
+                lp = np.empty_like(old); st = cb[1]                      # damping: a gentle one-pole low-pass
+                lp[0] = 0.75 * old[0] + 0.25 * st
+                lp[1:] = 0.75 * old[1:] + 0.25 * old[:-1]; cb[1] = float(old[-1])
+                y = x + fb * lp
+                buf[:-BLOCK] = buf[BLOCK:]; buf[-BLOCK:] = y; acc += old
+            wet = []
+            for chain in (self.rv['ap'], self.rv['ap2']):
+                v = acc
+                for buf in chain:
+                    d = buf[:BLOCK].copy(); w_ = v + 0.5 * d; y = -0.5 * w_ + d
+                    buf[:-BLOCK] = buf[BLOCK:]; buf[-BLOCK:] = w_; v = y
+                wet.append(v)
+            out[:, 0] += wet[0] * r * 0.9; out[:, 1] += wet[1] * r * 0.9
+        elif self.rv is not None and r <= 0.005:
+            self.rv = None
+
+
+def mic_devices():
+    """[(id, name)] of the computer's microphones (Windows), -1 = the default one."""
+    out = [(-1, 'Default microphone')]
+    if sys.platform != 'win32': return out
+    try:
+        import ctypes
+        class CAPS(ctypes.Structure):
+            _fields_ = [('wMid', ctypes.c_ushort), ('wPid', ctypes.c_ushort), ('vDriverVersion', ctypes.c_uint),
+                        ('szPname', ctypes.c_wchar * 32), ('dwFormats', ctypes.c_uint), ('wChannels', ctypes.c_ushort),
+                        ('wReserved1', ctypes.c_ushort)]
+        w = ctypes.windll.winmm
+        for i in range(w.waveInGetNumDevs()):
+            c = CAPS()
+            if w.waveInGetDevCapsW(i, ctypes.byref(c), ctypes.sizeof(c)) == 0: out.append((i, c.szPname))
+    except Exception:
+        pass
+    return out
+
+
+def _open_mic(dev):
+    try:
+        if sys.platform == 'win32': return _WinMic(dev)
+    except Exception as ex:
+        if LOG_PATH:
+            try:
+                with open(LOG_PATH, 'a', encoding='utf-8') as f: f.write('%s mic: could not open (%r)\n' % (time.strftime('%H:%M:%S'), ex))
+            except Exception: pass
+    return None
+
+
+class _WinMic:
+    """The microphone through winmm waveIn (mono 16-bit, 8 ms buffers), mixed into the output with an echo
+    (delay ctl echo_ms, feedback ctl echo 0..0.9) and a level (ctl mic_vol 0..2): you hear yourself in the speakers
+    like on the real player's microphone input."""
+    NB = 8; N = 256
+    def __init__(self, dev):
+        import ctypes, numpy as np
+        class WAVEFORMATEX(ctypes.Structure):
+            _fields_ = [('wFormatTag', ctypes.c_ushort), ('nChannels', ctypes.c_ushort), ('nSamplesPerSec', ctypes.c_uint),
+                        ('nAvgBytesPerSec', ctypes.c_uint), ('nBlockAlign', ctypes.c_ushort), ('wBitsPerSample', ctypes.c_ushort),
+                        ('cbSize', ctypes.c_ushort)]
+        class WAVEHDR(ctypes.Structure):
+            _fields_ = [('lpData', ctypes.c_void_p), ('dwBufferLength', ctypes.c_uint), ('dwBytesRecorded', ctypes.c_uint),
+                        ('dwUser', ctypes.c_void_p), ('dwFlags', ctypes.c_uint), ('dwLoops', ctypes.c_uint),
+                        ('lpNext', ctypes.c_void_p), ('reserved', ctypes.c_void_p)]
+        self.ct = ctypes; self.np = np; self.w = ctypes.windll.winmm
+        fmt = WAVEFORMATEX(1, 1, RATE, RATE * 2, 2, 16, 0)
+        self.h = ctypes.c_void_p()
+        dev_id = 0xFFFFFFFF if dev is None or dev < 0 else int(dev)          # WAVE_MAPPER
+        r = self.w.waveInOpen(ctypes.byref(self.h), ctypes.c_uint(dev_id), ctypes.byref(fmt), 0, 0, 0)
+        if r != 0: raise OSError('waveInOpen %d' % r)
+        self.bufs = []; self.hdrs = []
+        for _ in range(self.NB):
+            b = ctypes.create_string_buffer(self.N * 2); hd = WAVEHDR(); hd.lpData = ctypes.cast(b, ctypes.c_void_p); hd.dwBufferLength = self.N * 2
+            self.w.waveInPrepareHeader(self.h, ctypes.byref(hd), ctypes.sizeof(hd))
+            self.w.waveInAddBuffer(self.h, ctypes.byref(hd), ctypes.sizeof(hd))
+            self.bufs.append(b); self.hdrs.append(hd)
+        self.i = 0; self.fifo = np.zeros(0, np.float32); self.echo = np.zeros(RATE, np.float32); self.ep = 0
+        self.w.waveInStart(self.h)
+    def _collect(self):
+        np = self.np; got = []
+        for _ in range(self.NB):
+            hd = self.hdrs[self.i]
+            if not (hd.dwFlags & 1): break                                   # WHDR_DONE
+            n = hd.dwBytesRecorded // 2
+            got.append(np.frombuffer(self.ct.string_at(hd.lpData, n * 2), '<i2').astype(np.float32) / 32768.0)
+            hd.dwFlags &= ~1
+            self.w.waveInAddBuffer(self.h, self.ct.byref(hd), self.ct.sizeof(hd))
+            self.i = (self.i + 1) % self.NB
+        if got: self.fifo = np.concatenate([self.fifo] + got)
+        if len(self.fifo) > 3 * BLOCK: self.fifo = self.fifo[-2 * BLOCK:]   # never let the voice fall behind
+    def mix(self, out, ctl):
+        np = self.np
+        self._collect()
+        n = min(len(self.fifo), BLOCK)
+        x = np.zeros(BLOCK, np.float32); x[BLOCK - n:] = self.fifo[:n]; self.fifo = self.fifo[n:]
+        x *= float(ctl.get('mic_vol', 1.0)) * 1.5
+        fbk = min(0.9, max(0.0, float(ctl.get('echo', 0.3)))); d = int(min(0.9, max(0.03, ctl.get('echo_ms', 120) / 1000.0)) * RATE)
+        if fbk > 0.01:
+            e = self.echo; L = len(e); idx = (self.ep - d + np.arange(BLOCK)) % L
+            y = x + fbk * e[idx]
+            e[(self.ep + np.arange(BLOCK)) % L] = y; self.ep = (self.ep + BLOCK) % L
+            x = y
+        out[:, 0] += x; out[:, 1] += x
+    def close(self):
+        try:
+            self.w.waveInStop(self.h); self.w.waveInReset(self.h)
+            for hd in self.hdrs: self.w.waveInUnprepareHeader(self.h, self.ct.byref(hd), self.ct.sizeof(hd))
+            self.w.waveInClose(self.h)
+        except Exception:
+            pass
+
+
 def _finish_wav(f):
     n = f.tell() - 44
     f.seek(0)
     f.write(b'RIFF' + struct.pack('<I', 36 + n) + b'WAVEfmt ' + struct.pack('<IHHIIHH', 16, 1, 2, RATE, RATE * 4, 4, 16) +
             b'data' + struct.pack('<I', n))
     f.close()
+
+
+ANDROID = hasattr(sys, 'getandroidapilevel') or 'ANDROID_ROOT' in os.environ
+
+
+class _AndroidOut:
+    """Android: the phone's sound through AudioTrack (Java, reached through Chaquopy). write() blocks while the
+    track's buffer is full, which paces the synth like waveOut does on Windows."""
+    def __init__(self):
+        from java import jclass
+        AT = jclass('android.media.AudioTrack'); AF = jclass('android.media.AudioFormat'); AM = jclass('android.media.AudioManager')
+        mn = AT.getMinBufferSize(RATE, AF.CHANNEL_OUT_STEREO, AF.ENCODING_PCM_16BIT)
+        self.t = AT(AM.STREAM_MUSIC, RATE, AF.CHANNEL_OUT_STEREO, AF.ENCODING_PCM_16BIT, max(mn, BLOCK * 4 * 6), AT.MODE_STREAM)
+        self.t.play()
+        from java import jarray, jbyte
+        self.jbytes = jarray(jbyte)
+    def write(self, data):
+        # as a Java byte[]: Python bytes fit both write(byte[], ...) and write(short[], ...), which Chaquopy refuses
+        # as ambiguous - the synth stopped at its first block and the app had no sound at all
+        arr = self.jbytes(data); n = 0; total = len(data)
+        while n < total:
+            k = self.t.write(arr, n, total - n)
+            if k <= 0: break
+            n += k
+    def close(self):
+        try: self.t.stop(); self.t.release()
+        except Exception: pass
+
+
+class _QConn:
+    """One end of an in-process pipe (Android has no second process for the synth: it runs in a thread)."""
+    def __init__(self, inq, outq): self.inq = inq; self.outq = outq; self._peek = []
+    def send(self, obj): self.outq.put(obj)
+    def recv(self):
+        if self._peek: return self._peek.pop(0)
+        obj = self.inq.get()
+        if obj is _CLOSED: raise EOFError
+        return obj
+    def poll(self, timeout=0.0):
+        if self._peek: return True
+        import queue
+        try: obj = self.inq.get(timeout=timeout) if timeout else self.inq.get_nowait()
+        except queue.Empty: return False
+        if obj is _CLOSED: self._peek.append(None); return True     # recv() then gives None: the loop ends
+        self._peek.append(obj); return True
+    def close(self): self.outq.put(_CLOSED)
+_CLOSED = object()
+
+
+class _ThreadCtx:
+    """multiprocessing's Pipe / Process, with a thread instead of a process (Android)."""
+    def Pipe(self):
+        import queue
+        a, b = queue.Queue(), queue.Queue()
+        return _QConn(a, b), _QConn(b, a)
+    def Process(self, target, args=(), daemon=True):
+        import threading
+        return threading.Thread(target=target, args=args, daemon=daemon)
 
 
 class _WaveOut:
@@ -509,21 +815,40 @@ class _WaveOut:
         self.h = ctypes.c_void_p()
         r = self.w.waveOutOpen(ctypes.byref(self.h), 0xFFFFFFFF, ctypes.byref(fmt), None, None, 0)   # WAVE_MAPPER
         if r: raise RuntimeError('waveOutOpen failed (%d)' % r)
-        self.bufs = [ctypes.create_string_buffer(BLOCK * 4) for _ in range(NBUF)]
-        self.hdrs = []
-        for b in self.bufs:
-            h = WAVEHDR(); h.lpData = ctypes.cast(b, ctypes.c_void_p); h.dwBufferLength = BLOCK * 4
-            self.w.waveOutPrepareHeader(self.h, ctypes.byref(h), ctypes.sizeof(h)); h.dwFlags |= 1   # mark free (DONE)
-            self.hdrs.append(h)
-        self.i = 0
+        self.WAVEHDR = WAVEHDR
+        self.bufs = []; self.hdrs = []
+        for _ in range(NBUF): self._add(len(self.hdrs))
+        self.i = 0; self.underruns = 0; self.started = False
+
+    MAX_BUF = 16                                         # 16 x 16 ms: at most ~0.25 s of sound queued
+    def _add(self, at):
+        ctypes = self.ct
+        b = ctypes.create_string_buffer(BLOCK * 4)
+        h = self.WAVEHDR(); h.lpData = ctypes.cast(b, ctypes.c_void_p); h.dwBufferLength = BLOCK * 4
+        self.w.waveOutPrepareHeader(self.h, ctypes.byref(h), ctypes.sizeof(h)); h.dwFlags |= 1   # mark free (DONE)
+        self.bufs.insert(at, b); self.hdrs.insert(at, h)
 
     def write(self, data):
         h = self.hdrs[self.i]
+        if self.started and all(x.dwFlags & 1 for x in self.hdrs):
+            # every buffer already played: the sound card ran dry while this process waited for the CPU (a busy
+            # PC: OBS, a game, an Android emulator). Heard as the music dragging and stuttering. Keep more sound
+            # queued from now on (a little more delay, no more gaps).
+            self.underruns += 1
+            if len(self.hdrs) < self.MAX_BUF:
+                for _ in range(2): self._add(self.i)
+                h = self.hdrs[self.i]
+                if LOG_PATH:
+                    try:
+                        with open(LOG_PATH, 'a', encoding='utf-8') as f:
+                            f.write('%s synth: sound ran dry (busy PC) - now %d buffers (%d ms)\n' % (
+                                time.strftime('%H:%M:%S'), len(self.hdrs), len(self.hdrs) * BLOCK * 1000 // RATE))
+                    except Exception: pass
         while not (h.dwFlags & 1): time.sleep(0.002)    # WHDR_DONE: free again
         self.ct.memmove(self.bufs[self.i], data, len(data))
         h.dwFlags &= ~1
         self.w.waveOutWrite(self.h, self.ct.byref(h), self.ct.sizeof(h))
-        self.i = (self.i + 1) % NBUF
+        self.i = (self.i + 1) % len(self.hdrs); self.started = True
 
     def close(self):
         try:
@@ -537,8 +862,10 @@ class _WaveOut:
 class LiveSynth:
     """The parent side: send(msg) forwards MIDI messages to the synth process."""
     def __init__(self, sf_path, wav_path=None):
-        import multiprocessing
-        ctx = multiprocessing.get_context('spawn')
+        if ANDROID: ctx = _ThreadCtx()
+        else:
+            import multiprocessing
+            ctx = multiprocessing.get_context('spawn')
         self.conn, child = ctx.Pipe()
         import threading
         self._lock = threading.Lock()                 # the pipe is written from several threads (MIDI, chorus, panel)
@@ -596,4 +923,4 @@ class LiveSynth:
             with self._lock: self.conn.send(None)
         except Exception: pass
         self.proc.join(3)
-        if self.proc.is_alive(): self.proc.terminate()
+        if self.proc.is_alive() and hasattr(self.proc, 'terminate'): self.proc.terminate()   # (a thread on Android ends itself)

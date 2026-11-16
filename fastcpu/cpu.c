@@ -173,18 +173,20 @@ static inline int32_t S(uint32_t x) { return (int32_t)x; }
 EXPORT int32_t cpu_struct_size(void) { return (int32_t)sizeof(CPU); }
 
 EXPORT int32_t cpu_run(CPU *c, uint64_t max_instr) {
-    /* The hot state (instruction count, pc, npc) lives in locals and is stored into c only around anything that can
-       look at it: MMIO callbacks, the interrupt callback and every return. Same behaviour as the earlier version,
-       which kept them in c (memory) on every instruction. */
+    /* Threaded interpreter: every handler ends with its own fetch/decode/indirect jump (computed goto), which
+       predicts far better than one shared switch. The hot state (instruction count, pc, npc) lives in locals and
+       is stored into c only around anything that can look at it (MMIO callbacks, the interrupt callback, returns).
+       One compare per instruction (n against min(end, irq_next)) covers the budget and the interrupt check. */
     uint64_t n = c->n; const uint64_t end = n + max_instr;
     uint32_t pcl = c->pc, npcl = c->npc;
     uint32_t *r = c->r;
     uint8_t *const low = c->low; const uint32_t low_end = c->low_end;
     uint8_t *const ram = c->ram; const uint32_t ram_base = c->ram_base, ram_end = c->ram_end;
     const uint8_t *const bpmap = c->bpmap; const uint32_t bpbits = c->bpmap_bits;
-    uint32_t pc = pcl;
+    uint32_t pc = pcl, npc = npcl, w = 0, op, rs, rt, im, v; int32_t si;
+    uint64_t lim;
 #define OUT() (c->n = n, c->pc = pcl, c->npc = npcl, c->cur_pc = pc)
-#define IN()  (n = c->n, pcl = c->pc, npcl = c->npc)
+#define IN()  (n = c->n, pcl = c->pc, npcl = c->npc, lim = c->irq_next < end ? c->irq_next : end)
 #define RET(code) do { OUT(); return (code); } while (0)
 #define STOPHERE(code) do { pcl = pc; npcl = npc; n--; c->stop_word = w; RET(code); } while (0)
 #define RD(a, sz, ld) ({ uint32_t _p = (a) & 0x1FFFFFFF, _v; \
@@ -198,163 +200,189 @@ EXPORT int32_t cpu_run(CPU *c, uint64_t max_instr) {
 #define LD8(q) (*(q))
 #define ST8(q, v) (*(q) = (uint8_t)(v))
 #define ST16(q, v) st16((q), (uint16_t)(v))
-    while (n < end) {
-        if (n >= c->irq_next) {                     /* one compare per instruction: every slow check hangs off it */
-            OUT();
-            if (c->abort) return R_ABORT;
-            if (c->cap && c->cap_len + 64 > c->cap_size) { c->irq_next = c->n; return R_CAP; }
-            if (c->has_irq && c->npc == c->pc + 4) {
-                c->irq_next = c->irq_cb();
-                if (c->abort) { return R_ABORT; }
-            } else c->irq_next = c->n + 1;
-            if (c->cap && c->cap_len + 64 > c->cap_size) c->irq_next = c->n;
-            IN();
-        }
-        pc = pcl;
+    static const void *optab[64] = {
+        &&o_special, &&o_regimm, &&o_j, &&o_jal, &&o_beq, &&o_bne, &&o_blez, &&o_bgtz,
+        &&o_addi, &&o_addiu, &&o_slti, &&o_sltiu, &&o_andi, &&o_ori, &&o_xori, &&o_lui,
+        &&o_cop0, &&o_unimpl, &&o_unimpl, &&o_unimpl, &&o_unimpl, &&o_unimpl, &&o_unimpl, &&o_unimpl,
+        &&o_unimpl, &&o_unimpl, &&o_unimpl, &&o_unimpl, &&o_unimpl, &&o_unimpl, &&o_unimpl, &&o_unimpl,
+        &&o_lb, &&o_lh, &&o_lwl, &&o_lw, &&o_lbu, &&o_lhu, &&o_lwr, &&o_unimpl,
+        &&o_sb, &&o_sh, &&o_swl, &&o_sw, &&o_unimpl, &&o_unimpl, &&o_swr, &&o_unimpl,
+        &&o_unimpl, &&o_unimpl, &&o_unimpl, &&o_unimpl, &&o_unimpl, &&o_unimpl, &&o_unimpl, &&o_unimpl,
+        &&o_unimpl, &&o_unimpl, &&o_unimpl, &&o_unimpl, &&o_unimpl, &&o_unimpl, &&o_unimpl, &&o_unimpl };
+    lim = c->irq_next < end ? c->irq_next : end;
+#define NEXT() do { r[0] = 0; goto next; } while (0)
+#define DISPATCH() do { \
+        if (__builtin_expect(n >= lim, 0)) goto slow; \
+        pc = pcl; { uint32_t p_ = pc & 0x1FFFFFFF; \
+        if ((p_ >> 2) < bpbits && (bpmap[p_ >> 5] >> ((p_ >> 2) & 7) & 1)) goto bpcheck; \
+        if (__builtin_expect(p_ + 4 <= low_end, 1)) w = ld32(low + p_); \
+        else if (p_ >= ram_base && p_ + 4 <= ram_end) w = ld32(ram + (p_ - ram_base)); \
+        else RET(R_FETCH); } \
+        npc = npcl; pcl = npc; npcl = npc + 4; \
+        op = w >> 26; rs = (w >> 21) & 31; rt = (w >> 16) & 31; im = w & 0xFFFF; si = (int16_t)im; n++; \
+        goto *optab[op]; } while (0)
+
+next:
+    if (__builtin_expect(n >= lim, 0)) goto slow;
+    pc = pcl;
+    {
         uint32_t p = pc & 0x1FFFFFFF;
-        if ((p >> 2) < bpbits && (bpmap[p >> 5] >> ((p >> 2) & 7) & 1)) {
-            if (c->skip_bp) c->skip_bp = 0;
-            else RET(R_BP);
-        }
-        uint32_t w;
+        if ((p >> 2) < bpbits && (bpmap[p >> 5] >> ((p >> 2) & 7) & 1)) goto bpcheck;
+        if (__builtin_expect(p + 4 <= low_end, 1)) w = ld32(low + p);
+        else if (p >= ram_base && p + 4 <= ram_end) w = ld32(ram + (p - ram_base));
+        else RET(R_FETCH);
+    }
+    npc = npcl; pcl = npc; npcl = npc + 4;
+    op = w >> 26; rs = (w >> 21) & 31; rt = (w >> 16) & 31; im = w & 0xFFFF; si = (int16_t)im; n++;
+    goto *optab[op];
+
+bpcheck:
+    if (c->skip_bp) { c->skip_bp = 0; uint32_t p = pc & 0x1FFFFFFF;
         if (p + 4 <= low_end) w = ld32(low + p);
         else if (p >= ram_base && p + 4 <= ram_end) w = ld32(ram + (p - ram_base));
         else RET(R_FETCH);
-        uint32_t npc = npcl;
-        pcl = npc; npcl = npc + 4;
-        uint32_t op = w >> 26, rs = (w >> 21) & 31, rt = (w >> 16) & 31, im = w & 0xFFFF;
-        n++;
-        if (op == 9 && im == 0xFFFF && rs == rt && rt) {               /* busy-wait 'addiu r,r,-1 / bne' loops */
-            if (p >= ram_base && p + 16 <= ram_end) {
-                const uint8_t *q = ram + (p - ram_base);
-                uint32_t bne = 0x14000000u | (rt << 21), ln = 0;
-                if (ld32(q + 4) == (bne | 0xFFFE) && ld32(q + 8) == 0) ln = 3;
-                else if (ld32(q + 4) == 0 && ld32(q + 8) == (bne | 0xFFFD) && ld32(q + 12) == 0) ln = 4;
-                if (ln && r[rt]) {
-                    n += (uint64_t)r[rt] * ln; r[rt] = 0;
-                    pcl = pc + ln * 4; npcl = pcl + 4; continue;
-                }
-            }
+        npc = npcl; pcl = npc; npcl = npc + 4;
+        op = w >> 26; rs = (w >> 21) & 31; rt = (w >> 16) & 31; im = w & 0xFFFF; si = (int16_t)im; n++;
+        goto *optab[op]; }
+    RET(R_BP);
+
+slow:
+    if (n >= end) RET(R_BUDGET);
+    OUT();
+    if (c->abort) return R_ABORT;
+    if (c->cap && c->cap_len + 64 > c->cap_size) { c->irq_next = c->n; return R_CAP; }
+    if (c->has_irq && c->npc == c->pc + 4) {
+        c->irq_next = c->irq_cb();
+        if (c->abort) { return R_ABORT; }
+    } else c->irq_next = c->n + 1;
+    if (c->cap && c->cap_len + 64 > c->cap_size) c->irq_next = c->n;
+    IN();
+    goto next;
+
+o_special: {
+    uint32_t fn = w & 63, rd = (w >> 11) & 31, sh = (w >> 6) & 31;
+    switch (fn) {
+    case 0: v = r[rt] << sh; break;
+    case 2: v = r[rt] >> sh; break;
+    case 3: v = (uint32_t)(S(r[rt]) >> sh); break;
+    case 4: v = r[rt] << (r[rs] & 31); break;
+    case 6: v = r[rt] >> (r[rs] & 31); break;
+    case 7: v = (uint32_t)(S(r[rt]) >> (r[rs] & 31)); break;
+    case 8: npcl = r[rs]; NEXT();
+    case 9: { uint32_t t = r[rs]; r[rd] = pc + 8; npcl = t; NEXT(); }
+    case 12: pcl = pc; npcl = npc; n--; RET(R_SYSCALL);
+    case 13: pcl = pc; npcl = npc; n--; RET(R_BREAK);
+    case 16: v = c->hi; break;
+    case 17: c->hi = r[rs]; NEXT();
+    case 18: v = c->lo; break;
+    case 19: c->lo = r[rs]; NEXT();
+    case 24:
+        if (rd) { int64_t x = (int64_t)(int16_t)(r[rs] & 0xFFFF) * (int16_t)(r[rt] & 0xFFFF);
+                  c->lo = (uint32_t)x; c->hi = (uint32_t)((uint64_t)x >> 32); r[rd] = c->lo; }
+        else { int64_t x = (int64_t)S(r[rs]) * S(r[rt]); c->lo = (uint32_t)x; c->hi = (uint32_t)((uint64_t)x >> 32); }
+        NEXT();
+    case 25:
+        if (rd) { uint32_t x = (r[rs] & 0xFFFF) * (r[rt] & 0xFFFF); c->lo = x; c->hi = 0; r[rd] = x; }
+        else { uint64_t x = (uint64_t)r[rs] * r[rt]; c->lo = (uint32_t)x; c->hi = (uint32_t)(x >> 32); }
+        NEXT();
+    case 26: {
+        int32_t a = S(r[rs]), b = S(r[rt]);
+        if (b) {
+            if (a == INT32_MIN && b == -1) { c->lo = 0x80000000u; c->hi = 0; }
+            else { c->lo = (uint32_t)(a / b); c->hi = (uint32_t)(a - (a / b) * b); }
         }
-        int32_t si = (int16_t)im;
-        uint32_t v;
-        switch (op) {
-        case 0: {
-            uint32_t fn = w & 63, rd = (w >> 11) & 31, sh = (w >> 6) & 31;
-            switch (fn) {
-            case 0: v = r[rt] << sh; break;
-            case 2: v = r[rt] >> sh; break;
-            case 3: v = (uint32_t)(S(r[rt]) >> sh); break;
-            case 4: v = r[rt] << (r[rs] & 31); break;
-            case 6: v = r[rt] >> (r[rs] & 31); break;
-            case 7: v = (uint32_t)(S(r[rt]) >> (r[rs] & 31)); break;
-            case 8: npcl = r[rs]; r[0] = 0; continue;
-            case 9: { uint32_t t = r[rs]; r[rd] = pc + 8; npcl = t; r[0] = 0; continue; }
-            case 12: pcl = pc; npcl = npc; n--; RET(R_SYSCALL);
-            case 13: pcl = pc; npcl = npc; n--; RET(R_BREAK);
-            case 16: v = c->hi; break;
-            case 17: c->hi = r[rs]; continue;
-            case 18: v = c->lo; break;
-            case 19: c->lo = r[rs]; continue;
-            case 24:
-                if (rd) { int64_t x = (int64_t)(int16_t)(r[rs] & 0xFFFF) * (int16_t)(r[rt] & 0xFFFF);
-                          c->lo = (uint32_t)x; c->hi = (uint32_t)((uint64_t)x >> 32); r[rd] = c->lo; }
-                else { int64_t x = (int64_t)S(r[rs]) * S(r[rt]); c->lo = (uint32_t)x; c->hi = (uint32_t)((uint64_t)x >> 32); }
-                r[0] = 0; continue;
-            case 25:
-                if (rd) { uint32_t x = (r[rs] & 0xFFFF) * (r[rt] & 0xFFFF); c->lo = x; c->hi = 0; r[rd] = x; }
-                else { uint64_t x = (uint64_t)r[rs] * r[rt]; c->lo = (uint32_t)x; c->hi = (uint32_t)(x >> 32); }
-                r[0] = 0; continue;
-            case 26: {
-                int32_t a = S(r[rs]), b = S(r[rt]);
-                if (b) {
-                    if (a == INT32_MIN && b == -1) { c->lo = 0x80000000u; c->hi = 0; }
-                    else { c->lo = (uint32_t)(a / b); c->hi = (uint32_t)(a - (a / b) * b); }
-                }
-                continue; }
-            case 27: if (r[rt]) { c->lo = r[rs] / r[rt]; c->hi = r[rs] % r[rt]; } continue;
-            case 32: case 33: v = r[rs] + r[rt]; break;
-            case 34: case 35: v = r[rs] - r[rt]; break;
-            case 36: v = r[rs] & r[rt]; break;
-            case 37: v = r[rs] | r[rt]; break;
-            case 38: v = r[rs] ^ r[rt]; break;
-            case 39: v = ~(r[rs] | r[rt]); break;
-            case 42: v = S(r[rs]) < S(r[rt]); break;
-            case 43: v = r[rs] < r[rt]; break;
-            default: STOPHERE(R_SPECIAL);
-            }
-            if (rd) r[rd] = v;
-            continue; }
-        case 15: if (rt) r[rt] = im << 16; break;
-        case 8: case 9: if (rt) r[rt] = r[rs] + (uint32_t)si; break;
-        case 13: if (rt) r[rt] = r[rs] | im; break;
-        case 12: if (rt) r[rt] = r[rs] & im; break;
-        case 14: if (rt) r[rt] = r[rs] ^ im; break;
-        case 10: if (rt) r[rt] = S(r[rs]) < si; break;
-        case 11: if (rt) r[rt] = r[rs] < (uint32_t)si; break;
-        case 35: v = RD(r[rs] + (uint32_t)si, 4, ld32); if (rt) r[rt] = v; break;
-        case 43: WR(r[rs] + (uint32_t)si, r[rt], 4, st32); break;
-        case 36: v = RD(r[rs] + (uint32_t)si, 1, LD8); if (rt) r[rt] = v; break;
-        case 32: v = RD(r[rs] + (uint32_t)si, 1, LD8); if (rt) r[rt] = (uint32_t)(int32_t)(int8_t)v; break;
-        case 37: v = RD(r[rs] + (uint32_t)si, 2, ld16); if (rt) r[rt] = v; break;
-        case 33: v = RD(r[rs] + (uint32_t)si, 2, ld16); if (rt) r[rt] = (uint32_t)(int32_t)(int16_t)v; break;
-        case 40: WR(r[rs] + (uint32_t)si, r[rt] & 0xFF, 1, ST8); break;
-        case 41: WR(r[rs] + (uint32_t)si, r[rt] & 0xFFFF, 2, ST16); break;
-        case 4: if (r[rs] == r[rt]) npcl = npc + ((uint32_t)si << 2); break;
-        case 5: if (r[rs] != r[rt]) npcl = npc + ((uint32_t)si << 2); break;
-        case 6: if (S(r[rs]) <= 0) npcl = npc + ((uint32_t)si << 2); break;
-        case 7: if (S(r[rs]) > 0) npcl = npc + ((uint32_t)si << 2); break;
-        case 1: {
-            int32_t x = S(r[rs]); int cnd;
-            if (rt == 0) cnd = x < 0;
-            else if (rt == 1) cnd = x >= 0;
-            else if (rt == 16) { cnd = x < 0; r[31] = pc + 8; }
-            else if (rt == 17) { cnd = x >= 0; r[31] = pc + 8; }
-            else STOPHERE(R_REGIMM);
-            if (cnd) npcl = npc + ((uint32_t)si << 2);
-            break; }
-        case 2: npcl = (npc & 0xF0000000u) | ((w & 0x3FFFFFF) << 2); break;
-        case 3: r[31] = pc + 8; npcl = (npc & 0xF0000000u) | ((w & 0x3FFFFFF) << 2); break;
-        case 34: {  /* lwl */
-            uint32_t a = r[rs] + (uint32_t)si, al = a & ~3u, k = a & 3;
-            uint32_t m = RD(al, 4, ld32), o = r[rt];
-            uint32_t sh = 8 * (3 - k);
-            uint32_t lowmask = (uint32_t)(((uint64_t)1 << sh) - 1);
-            v = (o & lowmask) | (uint32_t)((uint64_t)m << sh);
-            if (rt) r[rt] = v;
-            break; }
-        case 38: {  /* lwr */
-            uint32_t a = r[rs] + (uint32_t)si, al = a & ~3u, k = a & 3;
-            uint32_t m = RD(al, 4, ld32), o = r[rt];
-            if (k == 0) v = m;
-            else v = (m >> (8 * k)) | (o & (uint32_t)(((uint64_t)0xFFFFFFFFu << (8 * (4 - k))) & 0xFFFFFFFFu));
-            if (rt) r[rt] = v;
-            break; }
-        case 42: {  /* swl */
-            uint32_t a = r[rs] + (uint32_t)si, al = a & ~3u, k = a & 3;
-            uint32_t m = RD(al, 4, ld32), val = r[rt];
-            uint32_t mask = (uint32_t)(((uint64_t)1 << (8 * (k + 1))) - 1);
-            WR(al, (m & ~mask) | (val >> (8 * (3 - k))), 4, st32);
-            break; }
-        case 46: {  /* swr */
-            uint32_t a = r[rs] + (uint32_t)si, al = a & ~3u, k = a & 3;
-            uint32_t m = RD(al, 4, ld32), val = r[rt];
-            uint32_t mask = (uint32_t)(((uint64_t)0xFFFFFFFFu << (8 * k)) & 0xFFFFFFFFu);
-            WR(al, (m & ~mask) | (uint32_t)(((uint64_t)val << (8 * k)) & 0xFFFFFFFFu), 4, st32);
-            break; }
-        case 16: {
-            uint32_t rd = (w >> 11) & 31;
-            if (rs == 0) { if (rt) r[rt] = c->cp0[rd]; }
-            else if (rs == 4) { c->cp0[rd] = r[rt]; if (rd == 12 || rd == 13) c->irq_next = n; }
-            else if (rs == 16 && (w & 63) == 16) { uint32_t sr = c->cp0[12]; c->cp0[12] = (sr & ~0xFu) | ((sr >> 2) & 0xF); c->irq_next = n; }
-            else STOPHERE(R_COP0);
-            break; }
-        default:
-            STOPHERE(R_UNIMPL);
-        }
-        r[0] = 0;
+        NEXT(); }
+    case 27: if (r[rt]) { c->lo = r[rs] / r[rt]; c->hi = r[rs] % r[rt]; } NEXT();
+    case 32: case 33: v = r[rs] + r[rt]; break;
+    case 34: case 35: v = r[rs] - r[rt]; break;
+    case 36: v = r[rs] & r[rt]; break;
+    case 37: v = r[rs] | r[rt]; break;
+    case 38: v = r[rs] ^ r[rt]; break;
+    case 39: v = ~(r[rs] | r[rt]); break;
+    case 42: v = S(r[rs]) < S(r[rt]); break;
+    case 43: v = r[rs] < r[rt]; break;
+    default: STOPHERE(R_SPECIAL);
     }
-    RET(R_BUDGET);
+    r[rd] = v; r[0] = 0;
+    DISPATCH(); }
+o_lui: r[rt] = im << 16; r[0] = 0; DISPATCH();
+o_addi:
+o_addiu: {
+    uint32_t p = pc & 0x1FFFFFFF;
+    if (__builtin_expect(im == 0xFFFF && rs == rt && rt, 0) && p >= ram_base && p + 16 <= ram_end) {
+        /* busy-wait 'addiu r,r,-1 / bne' loops */
+        const uint8_t *q = ram + (p - ram_base);
+        uint32_t bne = 0x14000000u | (rt << 21), ln = 0;
+        if (ld32(q + 4) == (bne | 0xFFFE) && ld32(q + 8) == 0) ln = 3;
+        else if (ld32(q + 4) == 0 && ld32(q + 8) == (bne | 0xFFFD) && ld32(q + 12) == 0) ln = 4;
+        if (ln && r[rt]) {
+            n += (uint64_t)r[rt] * ln; r[rt] = 0;
+            pcl = pc + ln * 4; npcl = pcl + 4; goto next;
+        }
+    }
+    r[rt] = r[rs] + (uint32_t)si; r[0] = 0; DISPATCH(); }
+o_ori: r[rt] = r[rs] | im; r[0] = 0; DISPATCH();
+o_andi: r[rt] = r[rs] & im; r[0] = 0; DISPATCH();
+o_xori: r[rt] = r[rs] ^ im; r[0] = 0; DISPATCH();
+o_slti: r[rt] = S(r[rs]) < si; r[0] = 0; DISPATCH();
+o_sltiu: r[rt] = r[rs] < (uint32_t)si; r[0] = 0; DISPATCH();
+o_lw: v = RD(r[rs] + (uint32_t)si, 4, ld32); r[rt] = v; r[0] = 0; DISPATCH();
+o_sw: WR(r[rs] + (uint32_t)si, r[rt], 4, st32); DISPATCH();
+o_lbu: v = RD(r[rs] + (uint32_t)si, 1, LD8); r[rt] = v; r[0] = 0; DISPATCH();
+o_lb: v = RD(r[rs] + (uint32_t)si, 1, LD8); r[rt] = (uint32_t)(int32_t)(int8_t)v; r[0] = 0; DISPATCH();
+o_lhu: v = RD(r[rs] + (uint32_t)si, 2, ld16); r[rt] = v; r[0] = 0; DISPATCH();
+o_lh: v = RD(r[rs] + (uint32_t)si, 2, ld16); r[rt] = (uint32_t)(int32_t)(int16_t)v; r[0] = 0; DISPATCH();
+o_sb: WR(r[rs] + (uint32_t)si, r[rt] & 0xFF, 1, ST8); DISPATCH();
+o_sh: WR(r[rs] + (uint32_t)si, r[rt] & 0xFFFF, 2, ST16); DISPATCH();
+o_beq: if (r[rs] == r[rt]) npcl = npc + ((uint32_t)si << 2); DISPATCH();
+o_bne: if (r[rs] != r[rt]) npcl = npc + ((uint32_t)si << 2); DISPATCH();
+o_blez: if (S(r[rs]) <= 0) npcl = npc + ((uint32_t)si << 2); DISPATCH();
+o_bgtz: if (S(r[rs]) > 0) npcl = npc + ((uint32_t)si << 2); DISPATCH();
+o_regimm: {
+    int32_t x = S(r[rs]); int cnd;
+    if (rt == 0) cnd = x < 0;
+    else if (rt == 1) cnd = x >= 0;
+    else if (rt == 16) { cnd = x < 0; r[31] = pc + 8; }
+    else if (rt == 17) { cnd = x >= 0; r[31] = pc + 8; }
+    else STOPHERE(R_REGIMM);
+    if (cnd) npcl = npc + ((uint32_t)si << 2);
+    DISPATCH(); }
+o_j: npcl = (npc & 0xF0000000u) | ((w & 0x3FFFFFF) << 2); DISPATCH();
+o_jal: r[31] = pc + 8; npcl = (npc & 0xF0000000u) | ((w & 0x3FFFFFF) << 2); DISPATCH();
+o_lwl: {
+    uint32_t a = r[rs] + (uint32_t)si, al = a & ~3u, k = a & 3;
+    uint32_t m = RD(al, 4, ld32), o = r[rt];
+    uint32_t sh = 8 * (3 - k);
+    uint32_t lowmask = (uint32_t)(((uint64_t)1 << sh) - 1);
+    v = (o & lowmask) | (uint32_t)((uint64_t)m << sh);
+    r[rt] = v; r[0] = 0; DISPATCH(); }
+o_lwr: {
+    uint32_t a = r[rs] + (uint32_t)si, al = a & ~3u, k = a & 3;
+    uint32_t m = RD(al, 4, ld32), o = r[rt];
+    if (k == 0) v = m;
+    else v = (m >> (8 * k)) | (o & (uint32_t)(((uint64_t)0xFFFFFFFFu << (8 * (4 - k))) & 0xFFFFFFFFu));
+    r[rt] = v; r[0] = 0; DISPATCH(); }
+o_swl: {
+    uint32_t a = r[rs] + (uint32_t)si, al = a & ~3u, k = a & 3;
+    uint32_t m = RD(al, 4, ld32), val = r[rt];
+    uint32_t mask = (uint32_t)(((uint64_t)1 << (8 * (k + 1))) - 1);
+    WR(al, (m & ~mask) | (val >> (8 * (3 - k))), 4, st32);
+    DISPATCH(); }
+o_swr: {
+    uint32_t a = r[rs] + (uint32_t)si, al = a & ~3u, k = a & 3;
+    uint32_t m = RD(al, 4, ld32), val = r[rt];
+    uint32_t mask = (uint32_t)(((uint64_t)0xFFFFFFFFu << (8 * k)) & 0xFFFFFFFFu);
+    WR(al, (m & ~mask) | (uint32_t)(((uint64_t)val << (8 * k)) & 0xFFFFFFFFu), 4, st32);
+    DISPATCH(); }
+o_cop0: {
+    uint32_t rd = (w >> 11) & 31;
+    if (rs == 0) { r[rt] = c->cp0[rd]; r[0] = 0; }
+    else if (rs == 4) { c->cp0[rd] = r[rt]; if (rd == 12 || rd == 13) { c->irq_next = n; lim = n; } }
+    else if (rs == 16 && (w & 63) == 16) { uint32_t sr = c->cp0[12]; c->cp0[12] = (sr & ~0xFu) | ((sr >> 2) & 0xF); c->irq_next = n; lim = n; }
+    else STOPHERE(R_COP0);
+    DISPATCH(); }
+o_unimpl:
+    STOPHERE(R_UNIMPL);
 }
 
 /* ---- helper for the built-in SoundFont synth (livesynth.py): a biquad filter over one block, in place.

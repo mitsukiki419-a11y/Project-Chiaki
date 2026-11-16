@@ -11,12 +11,14 @@ IS_WIN = sys.platform == 'win32'
 _done = {}
 
 
-def _throttle_state():
+def _throttle_state(thread=False):
     import ctypes
     class STATE(ctypes.Structure):
         _fields_ = [('Version', ctypes.c_ulong), ('ControlMask', ctypes.c_ulong), ('StateMask', ctypes.c_ulong)]
-    # ControlMask EXECUTION_SPEED (1) | IGNORE_TIMER_RESOLUTION (4); StateMask 0 = never throttle
-    return STATE(1, 1 | 4, 0)
+    # ControlMask EXECUTION_SPEED (1) | IGNORE_TIMER_RESOLUTION (4, processes only); StateMask 0 = never throttle.
+    # (A thread given the process-only flag 4 was refused: the log said 'thread eco?' and Windows could still put
+    # the emulator thread on a slow efficiency core while other programs were busy - the MIDI slowed down.)
+    return STATE(1, 1 if thread else 1 | 4, 0)
 
 
 def _k32():
@@ -65,7 +67,7 @@ def thread(level='highest'):
     k = _k32(); out = []
     h = k.GetCurrentThread()
     try:
-        st = _throttle_state()
+        st = _throttle_state(thread=True)
         ok = k.SetThreadInformation(h, 3, ctypes.byref(st), ctypes.sizeof(st))       # ThreadPowerThrottling
         out.append('no-eco' if ok else 'eco?')
     except Exception:

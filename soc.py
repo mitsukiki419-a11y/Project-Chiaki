@@ -33,7 +33,9 @@ class SPIFlash:
     SECTOR = 0x1000
     def __init__(self, emu, log=None):
         self.emu = emu; self.wel = 0; self.status = 0; self.rd = {}; self.log = log if log is not None else []
-        self.nv = {} if FW_ID == 'ks5' else None      # sector index -> bytearray
+        # KS5 at 0x100000; the K55 keeps its Setup at 0x200000 (just past its 1 MB image: read back as 0 before, so
+        # every setting was 0 - NUMBER SOUND off - and its default-settings writes went into RAM at 0x80200000)
+        self.nv = {} if FW_ID in DSP_FWS else None      # sector index -> bytearray
         self.on_write = None
         emu.write_hooks[PB + 0x1708] = self.cmd
         emu.read_hooks[PB + 0x1714] = lambda e: self.rd.get(0x1714, e.mmio_regs.get(PB + 0x1714, 0))
@@ -103,7 +105,7 @@ FW_GP = 0x800045F4          # the firmware's global pointer (fixed once its star
 # Which firmware build is loaded (fwprofile.py). The hooks below are written with MP100NSP addresses; T() turns
 # one into the loaded build's address (None = that code is not in this build, the hook is not installed).
 FW_ID = 'mp100'; FWMAP = None; FWGP = None; FWDATA = None
-FW_GPS = {'mp100': 0x800045F4, 'migael': 0x800045F4, 'ks5': 0x80002C70}
+FW_GPS = {'mp100': 0x800045F4, 'migael': 0x800045F4, 'ks5': 0x80002C70, 'k55': 0x800055D0, 'k901': 0x80006718, 'k8005': 0x80007C74, 'u7000': 0x80003FE8, 'u7035': 0x80003FC0, 'wl8202': 0x800022FC}
 
 
 def set_firmware(fid):
@@ -140,7 +142,14 @@ def fw_gp(e):
     anywhere and an index into SDRAM then failed (IndexError). 0 until startup has set gp."""
     return FW_GP if e.r[28] else 0
 
-NEWSONG_LINE = 3.0               # KS5 new-song list: seconds per line (the real player's pace)
+KS5_MSG_SCALE = float(__import__('os').environ.get('KE_MSGSCALE', '3'))   # KS5 OSD message time x
+# Emulated CPU speed (instructions per emulated second). The firmware's own 1 ms delay loop implies 108 MHz;
+# KE_IPUS (instructions per microsecond) can lower it on slow computers: the free-running timers, the
+# interrupt periods and every emulated clock below follow it, so less host work is needed per emulated second.
+IPS = float(int(__import__('os').environ.get('KE_IPUS', 0) or 108) * 1_000_000)
+IPMS_ = int(IPS // 1000)            # instructions per emulated millisecond
+
+KS5_IDLE_TICK = 1 / 3.0          # KS5 idle-screen timer step (s): new-song list line = 9 steps = 3 s
 DSP_LOG = []                     # KS5 audio DSP commands (n, command, parameter), for tests
 DSP_STACKS = False
 
@@ -161,6 +170,9 @@ def attach(emu, echo=True):
     emu.midi = MidiOut(emu)
     emu.voice = KeyVoice(emu)
     emu.score = RandomScore(emu)
+    emu.player_keys = PlayerKeys(emu)
+    emu.fw_pictures = FirmwarePictures(emu)
+    emu.idle = IdleSkip(emu)
     emu.chorus = Chorus(emu)
     emu.setup_redraw = SetupRedraw(emu)
     emu.secchip = SecurityChip(emu)
@@ -170,15 +182,15 @@ def attach(emu, echo=True):
     # PB+0x4D4 to equal 0, 1 or 2). With nothing modelled every wait ran into its timeout (~1-2 M instructions each).
     # Modelled (INFERRED): 0x4D4 = phase of the current video field (0, 1, 2 in thirds of the 1 ms... field period),
     # 0x4C0 bit15 = set (display engine ready).
-    emu.read_hooks[PB + 0x4D4] = lambda e: ((e.n % 108000) * 3) // 108000
+    emu.read_hooks[PB + 0x4D4] = lambda e: ((e.n % IPMS_) * 3) // IPMS_
     emu.read_hooks[PB + 0x4C0] = lambda e: e.mmio_regs.get(PB + 0x4C0, 0) | 0x8000
     import os
     cid = os.environ.get('KE_CHIPID')                 # experimental: value returned by register 0 (chip ID/variant)
     if cid: emu.read_hooks[PB + 0x0] = (lambda v: lambda e: v)(int(cid, 0))
     # 0x204 bit0 = video field parity (odd/even). Toggles once per field (~108k instrs, matching the field IRQ period).
-    emu.read_hooks[PB + 0x204] = lambda e: (e.n // 108000) & 1
+    emu.read_hooks[PB + 0x204] = lambda e: (e.n // IPMS_) & 1
     # 0x50C bit15 = field indicator polled by 'wait N fields' (0x807818D0); toggles once per field
-    emu.read_hooks[PB + 0x50C] = lambda e: (((e.n // 108000) & 1) << 15) | (e.mmio_regs.get(PB + 0x50C, 0) & 0x7FFF)
+    emu.read_hooks[PB + 0x50C] = lambda e: (((e.n // IPMS_) & 1) << 15) | (e.mmio_regs.get(PB + 0x50C, 0) & 0x7FFF)
     # 0x070: control reg; bit11 = busy, self-clears (PLL/SDRAM init handshake)
     emu.read_hooks[PB + 0x070] = lambda e: e.mmio_regs.get(PB + 0x070, 0) & ~0x800
     def flush_w(e, p, v, size):          # 0x130: write-buffer flush; bit1 = request, bit0 cleared when done
@@ -187,7 +199,7 @@ def attach(emu, echo=True):
     def cmd_w(e, p, v, size):             # 0x720: command/serial controller; bits15:12 = busy, completes instantly
         e.mmio_regs[PB + 0x720] = v & ~0xF000
     emu.write_hooks[PB + 0x720] = cmd_w
-    if FW_ID == 'ks5':
+    if FW_ID in DSP_FWS:
         # Audio DSP command interface (the KS5 plays its songs through it; reverse-engineered from 0x880D266C,
         # 0x8800FBF4 and their callers):
         #   PB+0x4C0 command: (type << 8) | argument, bit15 = acknowledged by the DSP
@@ -204,15 +216,54 @@ def attach(emu, echo=True):
         # length and stops the song after a few seconds when it stops moving (0x8807DF0C). HLE: SongPlayer plays the file on the emulated clock into the MIDI output (the SoundFont synth).
         # PB+0x4EC: lyric events played so far (the lyric page).
         player = SongPlayer(emu)
+        x_ = __import__('fwprofile').extra(FW_ID)
+        if 'midi_buf' in x_: player.MIDI_BUF = x_['midi_buf']
+        if 'midi_rate' in x_: player.RATE = x_['midi_rate']
+        player.ZERO_AT_END = bool(x_.get('midi_clock_zero_at_end'))
+        player.LEN_GP = x_.get('song_len_gp', 0xFB4 if FW_ID == 'ks5' else None)
+        player.MP3_GP = x_.get('mp3_flag_gp', 0x101E if FW_ID == 'ks5' else None)
         emu.song_player = player
-        emu.write_hooks[PB + 0x4EC] = lambda e, p, v, size: (player.set_lyrics(e, v), e.ks5_ring.set_clock(e, v))
-        emu.read_hooks[PB + 0x4EC] = lambda e: player.lyrics(e)
+        midi_on_av = bool(x_.get('midi_on_av'))
+        ac = x_.get('auth_chip')
+        if ac:
+            # (K-8005) a check chip on I2C (write 0x52 / read 0x53): the firmware writes 0x11 to its registers and
+            # reads them back (0x40 -> 0xDD, 0x00 -> 0xEE) before it accepts a disc (0x88050034 must return
+            # 0x90986721, else it ejects). The chip is modelled by answering its read function as a genuine chip.
+            rd_, dev_, regs_ = ac['read'], ac['dev'], ac['regs']
+            def chip_read(e, dev_=dev_, regs_=regs_):
+                if (e.r[4] & 0xFF) == dev_:
+                    e.r[2] = regs_.get(e.r[5] & 0xFF, 0); e.pc = e.r[31]; e.npc = e.pc + 4
+            emu.hle[rd_] = chip_read; emu.bp.add(rd_)
+        sl = x_.get('song_loaded')
+        if sl:
+            # (K55) right after the firmware merged a new song into MIDI_BUF (its loader returns 2): the next
+            # A/V play starts it. Without this the idle screen's own 0x201 after Stop played the old song again.
+            def song_loaded(e):
+                if e.r[2] == 2: dsp['song_ready'] = True
+            emu.hle[sl] = song_loaded; emu.bp.add(sl)
+        if x_.get('av_clock'):
+            # K55: PB+0x4EC is the play clock of the type-2 (A/V audio) player: the MP2 sound of the background
+            # video, which the chip demuxes to the DSP itself. The firmware watches it move (0x8801D2CC) and
+            # restarts the audio when it stands still; the song's MIDI is only started once it runs.
+            av = AVClock(); emu.av_clock = av; player.av = av
+            emu.write_hooks[PB + 0x4EC] = lambda e, p, v, size: av.set(e, v)
+            emu.read_hooks[PB + 0x4EC] = lambda e: av.value(e)
+        else:
+            emu.write_hooks[PB + 0x4EC] = lambda e, p, v, size: (player.set_lyrics(e, v), e.ks5_ring.set_clock(e, v))
+            emu.read_hooks[PB + 0x4EC] = lambda e: player.lyrics(e)
         emu.write_hooks[PB + 0x4F0] = lambda e, p, v, size: player.seek(e, v)
         emu.read_hooks[PB + 0x4F0] = lambda e: player.position(e) & 0xFFFF
         # the firmware reads these ~100,000-300,000 times per second while a song plays: in the C core they are
         # plain registers that the run loop updates (SongPlayer.pump every ~10 ms) instead of Python calls
         if hasattr(emu, 'fast_computed') and emu.fast_computed(PB + 0x4F0, 3) and emu.fast_computed(PB + 0x4EC, 3):
             emu.read_hooks.pop(PB + 0x4F0, None); emu.read_hooks.pop(PB + 0x4EC, None); player.fast = True
+        def dsp_poll(e):
+            """(KS5) a 0x508 a moment ago: Stop (the firmware's song has stopped) or a Key press (still playing)."""
+            k = dsp.get('k508')
+            if k is not None and e.n - k > IPS * 0.4:
+                dsp.pop('k508', None)
+                if e.rd8(FW_GP + 4120) != 2: player.stop(e); dsp['midi'] = False
+        emu.dsp_poll = dsp_poll
         def dsp_cmd(e, p, v, size):
             e.mmio_regs[PB + 0x4C0] = v
             t = (v >> 8) & 0x7F
@@ -220,20 +271,47 @@ def attach(emu, echo=True):
                 sub = v & 0xFF
                 if sub == 1: e.ks5_ring.play(e, resume=False)
                 elif sub == 2: e.ks5_ring.play(e, resume=True)
-                elif sub == 3: e.ks5_ring.stop(e)
+                elif sub == 3: e.ks5_ring.stop(e); dsp['av_stop'] = e.n
                 elif sub == 4: e.ks5_ring.pause(e)
+                av = getattr(e, 'av_clock', None)
+                if av is not None:
+                    if sub in (1, 2): av.run(e)
+                    elif sub in (3, 4): av.hold(e)
+                if midi_on_av:
+                    # K55: no separate MIDI command; the song (merged at MIDI_BUF) plays with the A/V player.
+                    # 0x201 comes again when the background video loops: a playing song goes on.
+                    if sub in (1, 2) and not player.playing and dsp.get('song_ready'):
+                        dsp['song_ready'] = False
+                        player.loaded = False; player.sec = 0.0; player.i = 0; player.lyric = 0
+                        player.play(e); dsp['midi'] = bool(player.ev)
+                    elif sub == 3 and player.playing:
+                        player.stop(e); dsp['midi'] = False
             if t in (2, 0x27):
                 sub = v & 0xFF; k = 'state' if t == 2 else 'state2'
                 if sub in (1, 2): dsp[k] = 1
                 elif sub == 3: dsp[k] = 0
                 elif sub == 4: dsp[k] = 2
-            elif t == 5 and (v & 0xFF) == 8:   # 0x508: stop the song (sent by Stop and before each new song)
-                player.stop(e); dsp['midi'] = False
-            elif t == 3:                    # the song (MIDI) player: 1 = play, 2 = stop
+            elif t == 5:
+                # 0x5nn: the Key setting, nn - 8 semitones (0x508 = the song's own key). The DSP plays the song (MIDI
+                # and MP3): e.fw_key goes to the synth, which also shifts the recorded music.
+                # Stop and each new song send 0x508 - and so does a Key press (its first one: 0x508 = the song's own
+                # key). On the KS5 the song player stops only if the firmware's song has stopped too (gp+4120 no longer
+                # 2), looked at a moment later (dsp_poll; at the 0x508 itself it still says 2); other builds: at once.
+                e.fw_key = (v & 0xFF) - 8
+                if (v & 0xFF) == 8:
+                    if FW_ID != 'ks5' or e.n - dsp.get('av_stop', -10 ** 18) < IPS or e.rd8(FW_GP + 4120) != 2:
+                        player.stop(e); dsp['midi'] = False
+                    else:
+                        dsp['k508'] = e.n
+            if t == 3 and (v & 0xFF) in (0x0B, 0x0C):
+                # (KS5) the Melody setting, from its MELODY ON / OFF message (0x8801A210): 0x30C = on, 0x30B = off
+                e.fw_melody = (v & 0xFF) == 0x0C
+            elif t == 3 and not midi_on_av:  # the song (MIDI) player: 1 = play, 2 = stop
+                # (A/V-player builds send 0x303 / 0x302 around the song start - the Unikon right after its 0x201)
                 sub = v & 0xFF
-                if sub == 1: player.play(e); dsp['midi'] = True
+                if sub == 1: player.play(e); dsp['midi'] = True; e.fw_melody = True     # a new song: its melody plays
                 elif sub == 2: player.stop(e); dsp['midi'] = False
-            DSP_LOG.append((e.n, v, e.mmio_regs.get(PB + 0x4C4, 0)) + ((tuple(hex(e.rd32(e.r[29] + k)) for k in range(0, 400, 4) if 0x88000000 <= e.rd32(e.r[29] + k) < 0x88200000)[:10],) if DSP_STACKS else ()))
+            DSP_LOG.append((e.n, v, e.mmio_regs.get(PB + 0x4C4, 0)) + ((tuple(hex(e.rd32(e.r[29] + k)) for k in range(0, 400, 4) if 0x88000000 <= e.rd32(e.r[29] + k) < 0x88200000 or 0x80200000 <= e.rd32(e.r[29] + k) < 0x80800000)[:10],) if DSP_STACKS else ()))
             if len(DSP_LOG) > 4000: del DSP_LOG[:1000]
         def dsp_state_w(e, p, v, size):
             dsp['state'] = 0 if (v & 0xFFFFFFFF) == 0xFFFFFFFF else v       # -1: new code loaded, the DSP restarts
@@ -264,18 +342,43 @@ def attach(emu, echo=True):
             def no_reload(e, to=to):
                 e.pc = to; e.npc = to + 4
             emu.hle[at] = no_reload; emu.bp.add(at)
-        # New-song list: one line is drawn each time a counter (gp+2424) reaches 9; the counter is stepped from the
-        # main loop, which runs far more often here than on the player (~0.2 s a line instead of ~3 s). The step
-        # is paced on the emulated clock instead: a line every NEWSONG_LINE seconds.
-        ns = _fp.extra(FW_ID).get('newsong_step')
-        if ns:
-            at, skip, cnt = ns; last = [None]
-            def ns_step(e, skip=skip, cnt=cnt):
-                if e.rd32(FW_GP + cnt) < 9: return                     # not due by the firmware's own count
-                if last[0] is not None and 0 <= e.n - last[0] < NEWSONG_LINE * 108_000_000:
-                    e.pc = skip; e.npc = skip + 4; return              # wait: leave the counter running
-                last[0] = e.n
-            emu.hle[at] = ns_step; emu.bp.add(at)
+        # OSD message timeouts (0x88088D68(ticks) -> gp+4172, counted down by the 50 ms main-loop tick): the
+        # 'Prog : 12345' / number box asks for 20 ticks, other messages 1-6. On the player they stay up for
+        # seconds; here they went in ~1 s (the tick rate is not known exactly). Scaled by MSG_SCALE.
+        ms = _fp.extra(FW_ID).get('msg_timeout')
+        sc_ = _fp.extra(FW_ID).get('msg_scale', KS5_MSG_SCALE)
+        if ms and sc_ != 1:
+            def msg_timeout(e, sc_=sc_):
+                a = e.r[4] & 0xFFFF
+                if a: e.r[4] = min(0xFFFF, int(a * sc_))
+            emu.hle[ms] = msg_timeout; emu.bp.add(ms)
+        for at_, to_, div_ in _fp.extra(FW_ID).get('slow_counters', ()):
+            # a counter increment (addiu v1,v1,1 at at_) that runs too often here: let 1 in div_ through
+            cnt_ = [0]
+            def slow_count(e, to_=to_, div_=div_, cnt_=cnt_):
+                cnt_[0] += 1
+                if cnt_[0] % div_: e.pc = to_; e.npc = to_ + 4
+            emu.hle[at_] = slow_count; emu.bp.add(at_)
+        rt = _fp.extra(FW_ID).get('region_timer')
+        if rt:
+            carry = [0]
+            def region_timer(e, div=rt[1]):
+                a = e.r[4]
+                if a & 0x80000000: return
+                t = a + carry[0]; e.r[4] = t // div; carry[0] = t % div
+            emu.hle[rt[0]] = region_timer; emu.bp.add(rt[0])
+        # Idle-screen timers 0x8808E6AC (gp+2424 ++: the new-song list draws a line every 9, a typed number's
+        # result stays until 151; gp+924/996/1012/1028: other screen timeouts). It is stepped from the main loop
+        # ~48 times a second here; the player's own pace is ~3 a second (a list line every 3 s), so it is let
+        # through at most every IDLE_TICK seconds.
+        it = _fp.extra(FW_ID).get('idle_tick')
+        if it:
+            nxt = [0]
+            def idle_tick(e):
+                if e.n < nxt[0]:
+                    e.pc = e.r[31]; e.npc = e.pc + 4; return            # not yet: return without counting
+                nxt[0] = e.n + int(KS5_IDLE_TICK * IPS)
+            emu.hle[it] = idle_tick; emu.bp.add(it)
         ring = KS5Ring(emu, dsp)
         emu.ks5_ring = ring
         emu.write_hooks[PB + 0x4C8] = ring.write
@@ -288,11 +391,11 @@ def attach(emu, echo=True):
     for off, (cm, sm) in FORCED_BITS.items():
         emu.read_hooks[PB + off] = (lambda off, cm, sm: lambda e: (e.mmio_regs.get(PB + off, 0) & ~cm) | sm)(off, cm, sm)
     if hasattr(emu, 'fast_computed'):        # the same functions, computed in the C core (busy-waited registers)
-        if FW_ID != 'ks5':
-            emu.fast_computed(PB + 0x4D4, 1, 108000, 3)
+        if FW_ID not in DSP_FWS:
+            emu.fast_computed(PB + 0x4D4, 1, IPMS_, 3)
             emu.fast_computed(PB + 0x4C0, 3, keep=0xFFFFFFFF, set_=0x8000)
-        emu.fast_computed(PB + 0x204, 2, 108000, 0, keep=0)
-        emu.fast_computed(PB + 0x50C, 2, 108000, 15, keep=0x7FFF)
+        emu.fast_computed(PB + 0x204, 2, IPMS_, 0, keep=0)
+        emu.fast_computed(PB + 0x50C, 2, IPMS_, 15, keep=0x7FFF)
         emu.fast_computed(PB + 0x070, 3, keep=~0x800 & 0xFFFFFFFF)
         for off, (cm, sm) in FORCED_BITS.items(): emu.fast_computed(PB + off, 3, keep=~cm & 0xFFFFFFFF, set_=sm)
         # also answered in C (each Python call from the core costs several microseconds; these were ~2000/s):
@@ -313,8 +416,10 @@ def attach(emu, echo=True):
 # Nothing raised it before, so after the background video started the karaoke task never ran again. Period
 # INFERRED as 8.98 ms (= 10 ms * 898/1000); checked against a song: the firmware's MIDI drum hits come 0.565-0.575 s
 # apart, the song file says 0.571 s.
-KARAOKE_TICK = 969_840        # instructions (8.98 ms at 108 MHz)
-DEFAULT_SOURCES = {9: 108000, 10: 108000, 13: KARAOKE_TICK}
+# builds whose songs play through the audio DSP's command interface (PB+0x4C0) rather than a serial synth chip
+DSP_FWS = ('ks5', 'k55', 'k901', 'k8005', 'u7000', 'u7035', 'wl8202')
+KARAOKE_TICK = int(0.00898 * IPS)   # instructions (8.98 ms; 969,840 at 108 MHz)
+DEFAULT_SOURCES = {9: int(IPS // 1000), 10: int(IPS // 1000), 13: KARAOKE_TICK}
 
 
 class IRQC:
@@ -324,7 +429,7 @@ class IRQC:
     # Group 2 (found in the dispatcher at 0x08002408): status PB+0x120, mask PB+0x118, ack (W1C) PB+0x11C -> CPU IP3.
     # Bit 0 = periodic tick that runs the drive module's timers (0x8802CA30 -> 0x8079E9A8). Period is INFERRED (1 ms fits
     # the firmware's 40 ms brake / 1.25 s motor / 2.5 s timeout constants); bits 4, 6, 8 are enabled but not modelled.
-    DEFAULT_SOURCES2 = {0: 108000}
+    DEFAULT_SOURCES2 = {0: int(IPS // 1000)}
 
     def __init__(self, emu, sources, sources2=None):
         self.emu = emu; self.pending = 0; self.sources = dict(sources)
@@ -343,53 +448,65 @@ class IRQC:
     def next_check(self, e):
         """For the C core: the instruction count at which poll() must run next (the next timer deadline, or soon if
         an unmasked interrupt is waiting for the CPU to enable interrupts)."""
-        if (self.pending & e.mmio_regs.get(PB + 0x100, 0)) or (self.pending2 & e.mmio_regs.get(PB + 0x118, 0)):
+        regs = e.mmio_regs
+        if (self.pending & regs.get(PB + 0x100, 0)) or (self.pending2 & regs.get(PB + 0x118, 0)):
             if e.cp0[12] & 1: return e.n + 1            # deliver as soon as the CPU is outside a delay slot
             # interrupts disabled: the C core checks again when the status register changes (mtc0 / rfe)
-        nx = [v for v in self.next.values()] + [v for v in self.next2.values()]
-        return min(nx) if nx else e.n + 100000
+        nx = self.next; nx2 = self.next2
+        m = min(nx.values()) if nx else e.n + 100000
+        if nx2:
+            m2 = min(nx2.values())
+            if m2 < m: m = m2
+        return m
     def ack(self, e, p, v, size): self.pending &= ~v; e.irq_next = e.n
     def ack2(self, e, p, v, size): self.pending2 &= ~v; e.irq_next = e.n
     def poll(self, e):
+        # Runs a few thousand times per emulated second (every timer tick and after every ack / mask write), so it
+        # reads each value once: on a busy PC this callback was a tenth of the emulator thread's time.
+        n = e.n; nx = self.next
         for b, per in self.sources.items():
-            if e.n >= self.next[b]:
-                self.pending |= 1 << b; self.next[b] = e.n + per
+            if n >= nx[b]:
+                self.pending |= 1 << b; nx[b] = n + per
+        nx = self.next2
         for b, per in self.sources2.items():
-            if e.n >= self.next2[b]:
-                self.pending2 |= 1 << b; self.next2[b] = e.n + per
-        mask = e.mmio_regs.get(PB + 0x100, 0)
-        if self.pending & mask: e.cp0[13] |= 0x400
-        else: e.cp0[13] &= ~0x400
-        mask2 = e.mmio_regs.get(PB + 0x118, 0)
-        if self.pending2 & mask2: e.cp0[13] |= 0x800
-        else: e.cp0[13] &= ~0x800
-        sr = e.cp0[12]
-        if (sr & 1) and (sr & e.cp0[13] & 0xFF00):
-            e.cp0[14] = e.pc
-            e.cp0[13] &= ~0x7C
-            e.cp0[12] = (sr & ~0x3F) | ((sr << 2) & 0x3C)
+            if n >= nx[b]:
+                self.pending2 |= 1 << b; nx[b] = n + per
+        regs = e.mmio_regs; cp0 = e.cp0
+        st = self.pending & regs.get(PB + 0x100, 0); st2 = self.pending2 & regs.get(PB + 0x118, 0)
+        c13 = cp0[13]
+        c13 = (c13 | 0x400) if st else (c13 & ~0x400)
+        c13 = (c13 | 0x800) if st2 else (c13 & ~0x800)
+        sr = cp0[12]
+        if (sr & 1) and (sr & c13 & 0xFF00):
+            cp0[14] = e.pc
+            cp0[13] = c13 & ~0x7C
+            cp0[12] = (sr & ~0x3F) | ((sr << 2) & 0x3C)
             e.pc = self.VECTOR; e.npc = self.VECTOR + 4
-            st = self.pending & mask
-            for b in range(16):
-                if st >> b & 1: self.delivered[b] = self.delivered.get(b, 0) + 1
-            st2 = self.pending2 & mask2
-            for b in range(16):
-                if st2 >> b & 1: self.delivered2[b] = self.delivered2.get(b, 0) + 1
+            d = self.delivered; b = 0
+            while st:
+                if st & 1: d[b] = d.get(b, 0) + 1
+                st >>= 1; b += 1
+            d = self.delivered2; b = 0
+            while st2:
+                if st2 & 1: d[b] = d.get(b, 0) + 1
+                st2 >>= 1; b += 1
+        else:
+            cp0[13] = c13
 
 
 class Timers:
     """Free-running counters driven by executed-instruction count (~108 instr/us, from the firmware's own 1 ms delay loop)."""
-    IPUS = 108
+    IPUS = int(IPS // 1_000_000)
     def __init__(self, emu):
         self.emu = emu; self.latched = 0
-        self.IPUS = int(__import__('os').environ.get('KE_IPUS', 0)) or Timers.IPUS
+        self.IPUS = int(IPS // 1_000_000)
         def us(e): return (e.n // self.IPUS) & 0xFFFFFFFF
         emu.write_hooks[PB + 0xE8] = lambda e, p, v, s: setattr(self, 'latched', us(e))
         emu.read_hooks[PB + 0xE0] = lambda e: self.latched & 0xFFFF
         emu.read_hooks[PB + 0xE4] = lambda e: (self.latched >> 16) & 0xFFFF
         emu.read_hooks[PB + 0x80] = lambda e: (us(e) // 10) & 0xFFFF     # 10 us ticks (unit assumed)
-        if FW_ID == 'ks5':
-            # KS5: PB+0x90/0x94 is a millisecond clock. Its main loop only runs when the count changes and runs its
+        if FW_ID in DSP_FWS:
+            # KS5 (and the K55, the same main loop: 0x802F930C): PB+0x90/0x94 is a millisecond clock. Its main loop only runs when the count changes and runs its
             # 50-count tick (OSD message timeouts: the 'Prog : 12345' box = 20 ticks = 1 s; the new-song list
             # typing, ~3 s a line) from it; counted in microseconds, all of these ran ~18x too fast.
             self.IPMS = self.IPUS * 1000
@@ -521,6 +638,7 @@ class VideoFIFO:
         # the RAM module is loaded at run time: only take over if the expected code is really there
         if em.rd32(0x8076F76C) == 0x90510000 and em.rd32(0x8076F780) == 0x38420100:
             self._scan_hook(em)
+    MAX_SEQ = 2 << 20              # a still picture is far smaller
     def scan(self, e, new=4):
         # incremental: only look at the newest bytes (a start code can straddle two writes, hence the overlap)
         b = self.buf; tail = max(len(b) - new - 12, 0)
@@ -531,6 +649,11 @@ class VideoFIFO:
             j = b.find(b'\x00\x00\x01\xb7', max(self.open_i, tail))
             if j >= 0:
                 self.frames.append((e.n, bytes(b[self.open_i:j + 4]))); self.pos = j + 4; self.open_i = None
+            elif len(b) - self.open_i > self.MAX_SEQ:
+                # moving background video (no sequence end for minutes): not a still picture. Let it go, or the
+                # buffer (which is not trimmed while a sequence is open) grew ~1.4 MB/s, gigabytes in an hour
+                k = b.find(b'\x00\x00\x01\xb3', len(b) - 64 * 1024)
+                self.pos = k if k >= 0 else len(b); self.open_i = None
 
 
 class ServoBus:
@@ -1005,6 +1128,12 @@ def osd_regions(emu):
 
 
 _EXPAND = {}
+# Megapro players (MP100, MIGAEL): their OSD is a 668-wide plane (26-pixel margins round a 616 x 426 area) that the
+# video encoder centres in the 720-wide picture, so on a TV it sits 26 pixels further right than its own x says.
+# Drawn at its own x, the score digits sat left of the SCORE picture's boxes.
+OSD_DX = {'mp100': 26, 'migael': 26}
+
+
 def osd_render(emu, w=OSD_W, h=OSD_H):
     """Compose the OSD regions into a w x h RGBA image (bytes, row-major). Returns (rgba, regions).
     Integer numpy: palette lookups through a byte->pixels table, plain copies where the palette is only opaque or
@@ -1013,9 +1142,10 @@ def osd_render(emu, w=OSD_W, h=OSD_H):
         import numpy as np
     except ImportError:
         return _osd_render_py(emu, w, h)
-    img = np.zeros((h, w, 4), np.uint8)
-    regs = osd_regions(emu); mem = emu.low
+    img = np.zeros((h, w, 4), np.uint8); img32 = img.view(np.uint32).reshape(h, w); drawn = False
+    regs = osd_regions(emu); mem = emu.low; dx = OSD_DX.get(FW_ID, 0)
     for r in regs:
+        if dx: r = dict(r, x=r['x'] + dx)
         bpp = r['bpp']
         if not r['enabled'] or bpp not in (1, 2, 4, 8) or r['height'] == 0: continue
         if r['pitch'] > 2048 or r['height'] > 1024 or r['x'] >= w or r['y'] >= h: continue
@@ -1024,31 +1154,43 @@ def osd_render(emu, w=OSD_W, h=OSD_H):
         pal = np.array(pal[:1 << bpp], np.uint8)
         src = r['bitmap'] & 0x1FFFFFFF; pitch = r['pitch']
         rows = min(r['height'], h - r['y']); width = min(r['width'], w - r['x'])
-        raw = np.frombuffer(bytes(mem[src:src + pitch * rows]), np.uint8)
-        if len(raw) < pitch * rows: continue
+        raw = np.frombuffer(mem, np.uint8, pitch * rows, src) if src + pitch * rows <= len(mem) else None
+        if raw is None: continue
         per = 8 // bpp
         ex = _EXPAND.get(bpp)
         if ex is None:
             mask = (1 << bpp) - 1
             ex = _EXPAND[bpp] = np.array([[(b >> ((per - 1 - k) * bpp)) & mask for k in range(per)] for b in range(256)], np.uint8)
-        idx = ex[raw.reshape(rows, pitch)].reshape(rows, pitch * per)[:, :width]
-        col = pal[idx]                                     # rows x width x 4
-        dst = img[r['y']:r['y'] + rows, r['x']:r['x'] + width]
         al = pal[:, 3]
-        if np.all((al == 0) | (al == 255)):
-            m = col[..., 3] == 255
-            dst[m] = col[m]
+        opaque = bool(np.all((al == 0) | (al == 255)))
+        if opaque or not drawn:
+            # opaque or clear only (or nothing under it yet, so blending over black-clear is a fixed colour per
+            # entry): one 32-bit lookup per pixel through a byte -> pixels table
+            if not opaque:
+                a16 = al.astype(np.uint16)[:, None]
+                pal = np.concatenate([((pal[:, :3] * a16) // 255).astype(np.uint8), al[:, None]], axis=1)
+            p32 = np.ascontiguousarray(pal).view(np.uint32).ravel()
+            lut = p32[ex]                                           # 256 x per
+            col = np.take(lut, raw.reshape(rows, pitch), axis=0).reshape(rows, pitch * per)[:, :width]
+            dst = img32[r['y']:r['y'] + rows, r['x']:r['x'] + width]
+            if not drawn: dst[...] = col
+            else: np.copyto(dst, col, where=(col >> 24) != 0)
         else:
+            idx = ex[raw.reshape(rows, pitch)].reshape(rows, pitch * per)[:, :width]
+            col = pal[idx]                                     # rows x width x 4
+            dst = img[r['y']:r['y'] + rows, r['x']:r['x'] + width]
             a = col[..., 3:4].astype(np.uint16)
             dst[..., :3] = ((col[..., :3] * a + dst[..., :3] * (255 - a)) // 255).astype(np.uint8)
             np.maximum(dst[..., 3], col[..., 3], out=dst[..., 3])
+        drawn = True
     return img.tobytes(), regs
 
 
 def _osd_render_py(emu, w=OSD_W, h=OSD_H):
     img = bytearray(w * h * 4)
-    regs = osd_regions(emu); mem = emu.low
+    regs = osd_regions(emu); mem = emu.low; dx = OSD_DX.get(FW_ID, 0)
     for r in regs:
+        if dx: r = dict(r, x=r['x'] + dx)
         bpp = r['bpp']
         if not r['enabled'] or bpp not in (1, 2, 4, 8) or r['height'] == 0: continue
         if r['pitch'] > 2048 or r['height'] > 1024 or r['x'] >= w or r['y'] >= h: continue   # header mid-update
@@ -1130,12 +1272,12 @@ class IRRemote:
     REG, CUSTOM = PB + 0x734, PB + 0x738
     CUSTOM_CODE = 0x205F
     TABLE = 0x880DD444
-    GAP = 5_400_000                      # ~50 ms between presses (the decoder needs the firmware to take each one)
+    GAP = int(0.05 * IPS)                # ~50 ms between presses (the decoder needs the firmware to take each one)
     # While a karaoke song plays, the firmware's main loop (which polls this register) is not reached: the song task
     # 0x080979F4 keeps running inside the main loop's task call. A key the register path does not take within
     # STUCK instructions is handed straight to the firmware's key dispatcher 0x080176AC instead, injected at the
     # entry of that song task (a call from there returns through a trampoline and the task then runs as usual).
-    STUCK = 27_000_000                   # 0.25 s
+    STUCK = int(0.25 * IPS)              # 0.25 s
     SONG_TASK = (0x880979F4, 0x080979F4)
     DISPATCH = 0x880176AC
     TRAMP = 0x881FFF00                   # unused RAM above the firmware image: return point of an injected call
@@ -1151,12 +1293,18 @@ class IRRemote:
         import fwprofile
         x = fwprofile.extra(FW_ID); self.direct = 'key_poll' in x; self._key_side = None
         if self.direct:
-            self._dispatch = x['key_dispatch']; self._key_side = x.get('key_side')
+            self._dispatch = x.get('key_dispatch'); self._key_side = x.get('key_side')
             emu.hle[x['key_poll']] = self._poll_entry; emu.bp.add(x['key_poll'])
     def _poll_entry(self, e):
         """(builds with key_poll) the firmware's remote poll: hand it the next key as if decoded."""
         if not self.queue or e.n < self.next_at: return
         key = self.queue.pop(0)
+        if isinstance(key, tuple) and key[0] == 'call':
+            # a firmware routine called as if a key had run it (e.g. the KS5's next background video); it returns
+            # to the poll's caller
+            e.pc = key[1]; e.npc = e.pc + 4
+            self.sent.append((e.n, key, 'call')); self.next_at = e.n + self.GAP
+            return
         if FW_ID == 'ks5':
             # KS5: during a song a typed number is reserved with the remote's PROG key (52); Enter is ignored
             # there. Enter (and the app's reserve key, 109) send PROG while a song plays, as on the Megapro.
@@ -1168,8 +1316,12 @@ class IRRemote:
         if x:
             gp = FW_GP & 0x1FFFFFFF
             a = gp + x[0]; e.low[a:a + 4] = ((int.from_bytes(e.low[a:a + 4], 'little') + 1) & 0xFFFFFFFF).to_bytes(4, 'little')
-            a = gp + x[1]; e.low[a:a + 4] = ((e.n // getattr(e.timers, 'IPMS', 108)) & 0xFFFFFFFF).to_bytes(4, 'little')
-        e.r[4] = key; e.pc = self._dispatch; e.npc = e.pc + 4          # returns to the poll's caller
+            a = gp + x[1]; e.low[a:a + 4] = ((e.n // getattr(e.timers, 'IPMS', int(IPS // 1000))) & 0xFFFFFFFF).to_bytes(4, 'little')
+        if self._dispatch is None:
+            # (K-8005) the poll returns the decoded key (0x8F = none) and its caller dispatches it
+            e.r[2] = key; e.pc = e.r[31]; e.npc = e.pc + 4
+        else:
+            e.r[4] = key; e.pc = self._dispatch; e.npc = e.pc + 4      # returns to the poll's caller
         self.sent.append((e.n, key, 'direct')); self.next_at = e.n + self.GAP
     def _arm(self, e, on):
         if on == self.armed: return
@@ -1185,7 +1337,7 @@ class IRRemote:
         self._saved_ra = (e.r[31], e.pc)
         e.r[4] = key; e.r[31] = self.TRAMP; e.pc = T(self.DISPATCH); e.npc = e.pc + 4
         self.sent.append((e.n, key, 'direct')); self.injected += 1
-        self.next_at = e.n + self.GAP; self.direct_until = e.n + 2 * 108_000_000
+        self.next_at = e.n + self.GAP; self.direct_until = e.n + int(2 * IPS)
     def _tramp(self, e):
         ra, pc = self._saved_ra or (e.r[31], self.SONG_TASK[0]); self._saved_ra = None
         e.r[31] = ra; e.pc = pc; e.npc = pc + 4
@@ -1200,8 +1352,8 @@ class IRRemote:
             if k != nokey and k not in m: m[k] = rev(idx)   # 100 (KS5: 101) = "no key"
         self.raw_for_key = m
     def press(self, key):
-        """Queue one key (firmware key number)."""
-        self.queue.append(int(key))
+        """Queue one key (firmware key number), or ('call', address) of a firmware routine (key_poll builds)."""
+        self.queue.append(key if isinstance(key, tuple) else int(key))
     def keys(self):
         if self.direct: return list(range(112))
         if self.raw_for_key is None: self._build_map()
@@ -1216,7 +1368,7 @@ class IRRemote:
         if reg & 0x8000 and self.sent and isinstance(self.sent[-1][2], int) and e.n - self.sent[-1][0] > self.STUCK:
             # not taken (a song is playing): withdraw it and give it to the dispatcher directly
             e.mmio_regs[self.REG] = reg & 0x7FFF
-            n, key, raw = self.sent.pop(); self.inject_q.append(key); self.direct_until = e.n + 2 * 108_000_000
+            n, key, raw = self.sent.pop(); self.inject_q.append(key); self.direct_until = e.n + int(2 * IPS)
             reg &= 0x7FFF
         if not self.queue or e.n < self.next_at: return
         if e.n < self.direct_until and e.n - max(getattr(self, 'task_seen', 0), self.armed_at) < self.STUCK:   # in a song: straight in
@@ -1262,17 +1414,29 @@ class KeyVoice:
     clip bytes; the app plays them on the PC."""
     CHECK = (0x880B488C, 0x080B488C)
     PLAY = (0x880AA908, 0x080AA908)
+    # a longer MP3 resource from flash (MIGAEL: the score fanfare, resources 31 / 32, when it is not a MIDI file):
+    # 0x080AA75C(ptr, 1, size, volume)
+    PLAY_LONG = (0x880AA75C, 0x080AA75C)
     def __init__(self, emu):
         self.emu = emu; self.enabled = True; self.seq = 0; self.last = None; self.clips = {}
         self.sink = None                       # optional fn(seq, data): called on the emulator thread, keep cheap
         for pc in TS(self.CHECK): emu.hle[pc] = self._check; emu.bp.add(pc)
         for pc in TS(self.PLAY): emu.hle[pc] = self._play; emu.bp.add(pc)
+        if FW_ID in ('mp100', 'migael'):
+            for pc in TS(self.PLAY_LONG): emu.hle[pc] = self._play_long; emu.bp.add(pc)
+    def _play_long(self, e):
+        ptr, size = e.r[4] & 0xFFFFFFFF, e.r[6]
+        if not (16 < size < 4 << 20): return
+        try: head = bytes(e.rd8(ptr + i) for i in range(4))
+        except Exception: return
+        if not (head[:3] == b'ID3' or (head[0] == 0xFF and head[1] & 0xE0 == 0xE0)): return   # MP3 only
+        self._play(e, ptr_size=(ptr, size))
     def _check(self, e):
         e.r[2] = 1 if self.enabled else 0                    # the page's "spoken numbers" switch decides
         e.pc = e.r[31]; e.npc = (e.pc + 4) & 0xFFFFFFFF
-    def _play(self, e):
-        ptr, size = e.r[4] & 0xFFFFFFFF, e.r[5]
-        if not (0 < size < 1 << 20): return
+    def _play(self, e, ptr_size=None):
+        ptr, size = ptr_size or (e.r[4] & 0xFFFFFFFF, e.r[5])
+        if not (0 < size < 4 << 20): return
         key = (ptr, size)
         data = self.clips.get(key)
         if data is None:
@@ -1285,6 +1449,95 @@ class KeyVoice:
             except Exception: self.sink = None
 
 
+class IdleSkip:
+    """The Megapro main loop 0x880355E8 runs ~213,000 times per emulated second; 99.6 % of the passes find its 1.2 ms
+    work tick not yet due (PB+0x80 - gp+2532 < 0x78) and do nothing but poll (~507 instructions each): nearly all
+    of the emulated CPU time. Such an idle pass is counted as SKIP instructions more (the player's time goes on)
+    without running them: ~10x fewer instructions per emulated second, so slow PCs keep 1x. Polling still happens
+    ~11,000 times a second; the 1.2 ms tick and the interrupts (song sequencer, timers) come as before."""
+    # OFF: the firmware also sends its MIDI bytes from those passes; skipping them lost ~10 % of the bytes (wrong
+    # instruments, hanging notes). Kept for testing only (KE_IDLESKIP=n).
+    SKIP = int(__import__('os').environ.get('KE_IDLESKIP', '0'))
+    def __init__(self, emu):
+        self.passes = 0; self.skipped = 0
+        if FW_ID == 'ks5' and self.SKIP > 0:
+            # KS5: its main-loop service 0x88037EB8 returns at once (0x88037ECC) while the millisecond clock has not
+            # moved on; such a pass skips ahead the same way (never past the next millisecond)
+            def hook_ks5(e):
+                self.passes += 1; self.skipped += 1
+                ipms = getattr(e.timers, 'IPMS', int(IPS // 1000))
+                e.n += max(0, min(self.SKIP, ipms - (e.n % ipms) - 200))
+            emu.hle[0x88037ECC] = hook_ks5; emu.bp.add(0x88037ECC)
+            return
+        at = T(0x88035614) if self.SKIP > 0 else None
+        if at is None: return
+        gp_off = 2532
+        def hook(e):
+            self.passes += 1
+            if ((e.r[17] - e.rd32(FW_GP + gp_off)) & 0xFFFFFFFF) < 0x78:      # s1 = PB+0x80 now
+                e.n += self.SKIP; self.skipped += 1
+        emu.hle[at] = hook; emu.bp.add(at)
+
+
+class FirmwarePictures:
+    """Pictures the firmware shows from its own flash (Megapro: the SCORE background after a song, its logo):
+    0x880B1060(a0 = the MPEG still in memory) plays one through the stream loop. Taken here, at the call, because in
+    the video FIFO such a picture arrives glued to the background video still in it (no sequence end between)."""
+    def __init__(self, emu):
+        self.list = []
+        at = T(0x880B1060) if FW_ID != 'ks5' else None
+        if at is None or getattr(emu, 'ram', None) is None: return
+        def hook(e):
+            a = e.r[4] & 0xFFFFFFFF
+            base = 0x88000000 if a >= 0x88000000 else 0x80000000 + 0x08000000
+            o = a - 0x88000000 if a >= 0x88000000 else None
+            if o is None or not (0 <= o < len(e.ram) - 16): return
+            blk = bytes(e.ram[o:o + (1 << 20)])
+            i = blk.find(b'\x00\x00\x01\xb3')
+            j = blk.find(b'\x00\x00\x01\xb7', i + 4) if 0 <= i < 64 else -1
+            if j > 0: self.list.append((e.n, blk[i:j + 4]))
+        emu.hle[at] = hook; emu.bp.add(at)
+
+
+
+class PlayerKeys:
+    """Megapro builds (MP100NSP, MIGAEL): the firmware's own Melody, Key and Tempo settings.
+    Melody (remote key 112, routine 0x880A0E30): level byte 0x80012202, 0 OFF / 1 SMALL / 2 NORMAL (default) /
+    3 BIG; the firmware scales the guide melody's notes (MIDI channel 1) by it and shows "MELODY : ..". Key (keys
+    14 / 16): struct 0x8000D6DC (+16 lowest, +17 highest, +18 current); Tempo (keys 101 / 102) at +33. Only taken
+    while a song plays (gp+1764 = 1). The firmware puts the tempo back to normal when a song starts (0x880AE018)
+    and the melody when a song is stopped, but keeps the key and the melody level from song to song: the hook on
+    the song start puts the melody back at once and asks the app for the key presses that bring the key back to 0,
+    as a player that starts every song in its own key."""
+    MELODY = 0x80012202
+    KEYS = 0x8000D6DC
+    SONG_START = {'mp100': 0x880AE018, 'migael': 0x880ADEAC}
+    MELODY_KEY = 112
+    def __init__(self, emu):
+        self.emu = emu; self.on = FW_ID in self.SONG_START; self.starts = 0; self.key_reset = False
+        if self.on:
+            a = self.SONG_START[FW_ID]          # (this build's own address: both the cached and uncached form)
+            for pc in (a, a & 0x0FFFFFFF): emu.hle[pc] = self._start; emu.bp.add(pc)
+    def _start(self, e):
+        self.starts += 1
+        if e.rd8(self.MELODY) != 2: e.wr8(self.MELODY, 2)
+        if self.key() != 0: self.key_reset = True
+    def in_song(self):
+        return self.on and self.emu.rd8(FW_GP + 1764) == 1
+    def key(self):
+        v = self.emu.rd8(self.KEYS + 18); return v - 256 if v > 127 else v
+    def key_range(self):
+        r = [self.emu.rd8(self.KEYS + 16 + i) for i in (0, 1)]
+        return tuple(v - 256 if v > 127 else v for v in r)
+    def melody(self):
+        return self.emu.rd8(self.MELODY)
+    def presses_to(self, target):
+        """Keys (14 = up, 16 = down) that move the firmware's key to `target`, within its range."""
+        lo, hi = self.key_range()
+        if lo > hi: lo, hi = -6, 6
+        target = max(lo, min(hi, target)); d = target - self.key()
+        return [14] * d if d > 0 else [16] * (-d)
+
 class RandomScore:
     """Score at the end of a song. The firmware's song-end routine 0x08098CF4 shows the score screen (and plays the
     fanfare for 90/80/70/60) through 0x080AACF8(score) only when its score value (s0 at 0x08098DD0) is 50 or more;
@@ -1295,8 +1548,37 @@ class RandomScore:
         import random
         self.enabled = True; self.rng = random.Random(); self.last = None; self.count = 0
         for pc in TS(self.PCS): emu.hle[pc] = self._hook; emu.bp.add(pc)
+        if FW_ID == 'ks5':
+            # KS5: the score is 75 + (time-of-day clock PB+0x90/0x94 % 26), read by 0x880B6EF4 just after the song
+            # (score level 1/2: 80 + % 21 / 90 + % 11; 0x8808A96C). That clock is the same at every song end here,
+            # so the score was always 86 or 100: the value read gets a random one (fanfare: fan0 70-80, fan1 81-90,
+            # fan2 91-100)
+            emu.hle[0x8808A9D8] = self._ks5; emu.bp.add(0x8808A9D8)
+            # ...but it scores only a song that was sung: gp+1036 counts the moments its voice check (0x8808E98C,
+            # the microphone level from the DSP) heard singing, and below 31 the score routine 0x8808A96C returns
+            # without a score. There is no microphone here, so whether a song scored depended on noise in that
+            # read: only sometimes. A song that played half a minute or more counts as sung.
+            emu.hle[0x8808A998] = self._ks5_sung; emu.bp.add(0x8808A998)
+    def _ks5_sung(self, e):
+        if not self.enabled or getattr(e, 'mv_song', False): return
+        played = 0.0
+        sp = getattr(e, 'song_player', None)
+        if sp is not None:
+            try: played = sp._sec(e)
+            except Exception: pass
+        rg = getattr(e, 'ks5_ring', None)
+        if rg is not None and getattr(rg, 'song', False):
+            try: played = max(played, rg.clock(e))
+            except Exception: pass
+        a = FW_GP + 1036
+        if played >= 30.0 and e.rd32(a) < 31: e.wr32(a, 31)
+    def _ks5(self, e):
+        if not self.enabled: return
+        e.r[2] = self.rng.getrandbits(31); self.count += 1
+        self.last = 75 + e.r[2] % 26
     def _hook(self, e):
         if not self.enabled: return
+        if getattr(e, 'mv_song', False): return       # music videos (MVV) are not scored: the firmware's own value stays
         r = self.rng.random()                     # mostly good scores, now and then a great or a so-so one
         sc = 100 if r < 0.08 else self.rng.randint(90, 99) if r < 0.40 else self.rng.randint(80, 89) if r < 0.80 else self.rng.randint(70, 79)
         e.r[16] = sc; self.last = sc; self.count += 1        # s0; the firmware's own code continues
@@ -1312,8 +1594,8 @@ class Chorus:
     def __init__(self, emu):
         self.enabled = True; self.seq = 0; self.sink = None; self.stop_sink = None; self.playing = False; self.log = []
         for pc in TS(self.PCS): emu.hle[pc] = self._play; emu.bp.add(pc)
-    def _play(self, e):
-        ptr, size = e.r[4] & 0xFFFFFFFF, e.r[5]
+    def _play(self, e, ptr_size=None):
+        ptr, size = ptr_size or (e.r[4] & 0xFFFFFFFF, e.r[5])
         p = ptr & 0x1FFFFFFF
         if not (0 < size < 16 << 20) or p + size > e.low_end: return
         data = bytes(e.low[p:p + size])
@@ -1321,11 +1603,11 @@ class Chorus:
         self.seq += 1; self.log.append((e.n, ptr, size)); del self.log[:-50]
         if self.enabled and self.sink is not None:
             self.playing = True
-            try: self.sink(self.seq, data, e.n / 108e6)
+            try: self.sink(self.seq, data, e.n / IPS)
             except Exception: pass
     def stop(self, e):
         if self.playing and self.stop_sink is not None:
-            try: self.stop_sink(e.n / 108e6)
+            try: self.stop_sink(e.n / IPS)
             except Exception: pass
         self.playing = False
 
@@ -1384,7 +1666,7 @@ class MidiOut:
                     if (self._st & 0xF0) == 0x90 and self._d[1]: self.last_note = e.n
                     self._d = []
         if self.sink is not None:
-            try: self.sink(b, e.n / 108e6)            # with the emulated time, for exact timing in the synth
+            try: self.sink(b, e.n / IPS)            # with the emulated time, for exact timing in the synth
             except TypeError:
                 try: self.sink(b)
                 except Exception: self.sink = None
@@ -1396,7 +1678,7 @@ class MidiOut:
         for b in msg:
             self.bytes.append((n, b)); self.total += 1
             if self.sink is not None:
-                try: self.sink(b, n / 108e6)
+                try: self.sink(b, n / IPS)
                 except TypeError:
                     try: self.sink(b)
                     except Exception: self.sink = None
@@ -1411,7 +1693,7 @@ class MidiOut:
         t0 = ev[0][0]; trk = bytearray(b'\x00\xff\x51\x03\x0f\x42\x40')     # tempo 1,000,000 us/beat, 1000 tpb
         last = 0
         for n, msg in ev:
-            t = int((n - t0) / 108000); d = max(0, t - last); last = max(last, t)
+            t = int((n - t0) / IPMS_); d = max(0, t - last); last = max(last, t)
             v = bytearray([d & 0x7F]); d >>= 7
             while d: v.insert(0, 0x80 | (d & 0x7F)); d >>= 7
             trk += v
@@ -1485,20 +1767,28 @@ class KS5Ring:
         self.dsp = dsp; self.pend = bytearray(); self.wr = 0; self.cons = 0; self.playing = False
         self.t0 = 0; self.sec = 0.0; self.last_w = 0; self.clip = bytearray(); self.started = False; self.no_out = False
         self.off = 0; self.armed = False; self.song = False; self.plays = 0
+        # where the firmware keeps the ring: gp offsets of its base address (word) and size in bytes (16 bits).
+        # KS5 2152 / 2458; the K55's feeder (0x80056F6C) uses 1604 / 1882
+        self.BASE_GP, self.SIZE_GP = __import__('fwprofile').extra(FW_ID).get('ring_gp', (2152, 2458))
     def _out(self, e): return getattr(e, 'ks5_audio', None)
     def reset(self, e, p=None, v=0, size=4):
         """The firmware sets both positions (0) before a new clip / song: what was not played is dropped."""
         e.mmio_regs[PB + 0x4CC] = v & 0xFFFF; self.wr = (v * 3); self.cons = v * 3; self.pend = bytearray()
     def write(self, e, p, v, size):
         e.mmio_regs[PB + 0x4C8] = v
-        gp = FW_GP; base = e.rd32(gp + 2152) & 0x1FFFFFFF
-        sz = e.low[(gp + 2458) & 0x1FFFFFFF] | e.low[(gp + 2459) & 0x1FFFFFFF] << 8
+        gp = FW_GP; base = e.rd32(gp + self.BASE_GP) & 0x1FFFFFFF
+        sz = e.low[(gp + self.SIZE_GP) & 0x1FFFFFFF] | e.low[(gp + self.SIZE_GP + 1) & 0x1FFFFFFF] << 8
         if not sz or not base: return
         new = (v * 3) % sz; old = self.wr % sz
         if new == old: return
         if new > old: self.pend += e.low[base + old: base + new]
         else: self.pend += e.low[base + old: base + sz]; self.pend += e.low[base: base + new]
         self.wr = new; self.last_w = e.n
+        if not self.playing and getattr(self, 'autostopped', False):
+            # data again after the ring stopped itself (a pause in a stream, not a stop from the firmware): the DSP
+            # plays on. Left stopped, nothing read the ring, the firmware's feeder waited for room forever and the
+            # background video and disc reading stopped with it (K16).
+            self.play(e, resume=True); self.dsp['state'] = 1
         self.pump(e)
     def set_clock(self, e, v):
         """The firmware sets the play clock (0 before a song): the next stream counts from there."""
@@ -1508,6 +1798,7 @@ class KS5Ring:
         div = e.rd32(FW_GP + 0x33C) or 3918
         return int(self.clock(e) * 900000 / div)
     def play(self, e, resume=False):
+        self.autostopped = False
         if not resume:
             # a new stream: the clock goes on from where it was (it never runs backwards, which the firmware would
             # take as a wrap), unless the firmware has just set it
@@ -1515,14 +1806,23 @@ class KS5Ring:
             # voice clips leave it alone
             self.song = bool(self.dsp.get('midi'))
             if self.song: self.off = 0
+            self.midi_stream = False; self.midi_cons = 0
             self.sec = 0.0; self.clip = bytearray(); self.started = False; self.no_out = False; self.plays += 1
-        self.t0 = e.n - int(self.sec * 108e6); self.playing = True; self.last_w = e.n
+        self.t0 = e.n - int(self.sec * IPS); self.playing = True; self.last_w = e.n
     def pause(self, e):
-        if self.playing: self.pump(e); self.sec = min(self.sec, (e.n - self.t0) / 108e6); self.playing = False
+        if self.playing: self.pump(e); self.sec = min(self.sec, (e.n - self.t0) / IPS); self.playing = False
     def stop(self, e):
+        self.autostopped = False
         self.pause(e); self._finish(e, stopped=True)
     def _finish(self, e, stopped=False):
-        self.playing = False; self.dsp['state'] = 0
+        self.playing = False
+        sp = getattr(e, 'song_player', None)
+        if sp is not None and sp.playing and __import__('fwprofile').extra(FW_ID).get('midi_on_av'):
+            # (Unikon) the DSP is still playing the song's MIDI: a sound clip running out of the ring must not
+            # report 'stopped' - the firmware took it as the song's end and stopped it after half a second
+            self.dsp['state'] = 1
+        else:
+            self.dsp['state'] = 0
         out = self._out(e)
         if out is not None and self.started:
             try: out.stop() if stopped else out.end()
@@ -1536,10 +1836,26 @@ class KS5Ring:
         self.started = False; self.clip = bytearray()
     def clock(self, e):
         if not self.playing: return self.sec
-        return min((e.n - self.t0) / 108e6, self.sec)
+        return min((e.n - self.t0) / IPS, self.sec)
+    midi_stream = False; midi_cons = 0
     def pump(self, e):
+        if (self.playing and not self.midi_stream and self.pend[:4] == b'MThd' and self.cons == self.midi_cons == 0
+                and __import__('fwprofile').extra(FW_ID).get('midi_on_av')):
+            self.midi_stream = True          # (only the Unikon / WOWE builds: the KS5 ends its songs when the ring is played out)
+        if self.playing and self.midi_stream:
+            # (Unikon) the song's MIDI file streamed through the ring to the DSP, which plays it: taken as the song
+            # plays (SongPlayer plays the copy the firmware also keeps in memory). Read as MP3, it was all taken at
+            # once, the firmware saw the file played out and ended the song after half a second.
+            sp = getattr(e, 'song_player', None)
+            target = (sp.byte_pos() + 4096) if (sp is not None and sp.playing) else self.midi_cons + len(self.pend)
+            n = max(0, min(len(self.pend), target - self.midi_cons))
+            if n: del self.pend[:n]; self.cons += n; self.midi_cons += n
+            gp = FW_GP
+            sz = (e.low[(gp + self.SIZE_GP) & 0x1FFFFFFF] | e.low[(gp + self.SIZE_GP + 1) & 0x1FFFFFFF] << 8) // 3 or 3072
+            e.mmio_regs[PB + 0x4CC] = (self.cons // 3) % sz
+            return
         if self.playing:
-            now = (e.n - self.t0) / 108e6; pend = self.pend; i = 0; out = self._out(e); took = bytearray()
+            now = (e.n - self.t0) / IPS; pend = self.pend; i = 0; out = self._out(e); took = bytearray()
             while i < len(pend):
                 f = mp3_frame(pend, i)
                 if f is None:
@@ -1553,7 +1869,7 @@ class KS5Ring:
                 if took:
                     if out is not None and not self.no_out:
                         try:
-                            if not self.started: out.start(self.t0 / 108e6); self.started = True
+                            if not self.started: out.start(self.t0 / IPS); self.started = True
                             out.feed(bytes(took))
                         except Exception as ex:
                             self.no_out = True
@@ -1561,16 +1877,37 @@ class KS5Ring:
                             except Exception: pass
                     if (out is None or self.no_out) and len(self.clip) < 200_000: self.clip += took
             if not pend and now > self.sec:
-                if e.n - self.last_w > 21_600_000:
+                if e.n - self.last_w > 0.2 * IPS:
                     self._finish(e)                 # played out and nothing more coming: the DSP stops
+                    self.autostopped = True
                 elif now > self.sec + 0.1:
-                    self.t0 = e.n - int((self.sec + 0.1) * 108e6)   # waiting for data: the clock waits too
+                    self.t0 = e.n - int((self.sec + 0.1) * IPS)   # waiting for data: the clock waits too
         gp = FW_GP
-        sz = (e.low[(gp + 2458) & 0x1FFFFFFF] | e.low[(gp + 2459) & 0x1FFFFFFF] << 8) // 3 or 3072
+        sz = (e.low[(gp + self.SIZE_GP) & 0x1FFFFFFF] | e.low[(gp + self.SIZE_GP + 1) & 0x1FFFFFFF] << 8) // 3 or 3072
         e.mmio_regs[PB + 0x4CC] = (self.cons // 3) % sz
-        if self.song and e.low[(gp + 0x101E) & 0x1FFFFFFF] == 1:        # MP3 song: the play clock
+        if self.song and FW_ID == 'ks5' and e.low[(gp + 0x101E) & 0x1FFFFFFF] == 1:        # MP3 song: the play clock
             div = e.rd32(gp + 0x33C) or 3918                # 90 kHz ticks * 10 per clock unit (3918 at 44.1 kHz, 1959 at 22.05)
             e.mmio_regs[PB + 0x4EC] = (self.off + int(self.clock(e) * 900000 / div)) & 0xFFFF
+
+
+class AVClock:
+    """Play clock of the DSP's A/V audio player (PB+0x4EC, 16 bits, wraps): runs while the player plays (DSP
+    command 0x201 / 0x202), holds on stop / pause (0x203 / 0x204); the firmware may set it. Unit 1/5512.5 s
+    (INFERRED: the same DSP clock as the MIDI player's PB+0x4F0)."""
+    RATE = 5512.5
+    def __init__(self):
+        self.base = 0; self.t0 = None
+    def value(self, e):
+        v = self.base
+        if self.t0 is not None: v += int((e.n - self.t0) / IPS * self.RATE)
+        return v & 0xFFFF
+    def set(self, e, v):
+        self.base = v & 0xFFFF
+        if self.t0 is not None: self.t0 = e.n
+    def run(self, e):
+        if self.t0 is None: self.t0 = e.n
+    def hold(self, e):
+        self.base = self.value(e); self.t0 = None
 
 
 class SongPlayer:
@@ -1583,6 +1920,8 @@ class SongPlayer:
     firmware's lyric table holds 90 kHz times and it converts the clock with * 2613 / 160 (0x88073A68); the song
     length it waits for (gp+0xFB4) is in the same units."""
     MIDI_BUF = 0x80068C00
+    LEN_GP = 0xFB4; MP3_GP = 0x101E
+    av = None               # AVClock (K55): PB+0x4EC is that clock, not the lyric count
     MAX = 0x2F000
     RATE = 5512.5
     def __init__(self, emu):
@@ -1593,8 +1932,12 @@ class SongPlayer:
         self.lyric = 0          # lyric events played (PB+0x4EC: the firmware picks the lyric page from it)
     def _parse(self, e):
         import struct
-        lo = e.low; a = self.MIDI_BUF & 0x1FFFFFFF
-        if bytes(lo[a:a + 4]) != b'MThd': return False
+        lo = e.low
+        bufs = self.MIDI_BUF if isinstance(self.MIDI_BUF, (tuple, list)) else (self.MIDI_BUF,)
+        for a in bufs:                       # (a build may merge into one of two buffers, by a setting)
+            a &= 0x1FFFFFFF
+            if bytes(lo[a:a + 4]) == b'MThd': break
+        else: return False
         div = struct.unpack('>H', bytes(lo[a + 12:a + 14]))[0] or 120
         p = a + 14
         if bytes(lo[p:p + 4]) != b'MTrk': return False
@@ -1606,8 +1949,9 @@ class SongPlayer:
                 c = lo[q]; q += 1; n = (n << 7) | (c & 0x7F)
                 if not c & 0x80: break
             return n, q
-        tempo = 500000; sec = 0.0; st = 0; ev = []
+        tempo = 500000; sec = 0.0; st = 0; ev = []; offs = []
         while p < end:
+            if len(offs) < len(ev): offs += [p - a] * (len(ev) - len(offs))
             d, p = vlq(p)
             sec += d * tempo / 1e6 / div
             b = lo[p]
@@ -1627,16 +1971,24 @@ class SongPlayer:
             need = 1 if (st & 0xE0) == 0xC0 else 2
             ev.append((sec, bytes([st]) + bytes(lo[p:p + need]))); p += need
         self.ev = ev
+        if len(offs) < len(ev): offs += [p - a] * (len(ev) - len(offs))
+        self.ev_off = offs; self.file_len = p - a
         return True
+    ev_off = (); file_len = 0
+    def byte_pos(self):
+        """How far into the MIDI file the song has played (bytes): for builds that also stream the file to the DSP."""
+        if not self.ev_off: return 0
+        if self.i >= len(self.ev): return self.file_len
+        return self.ev_off[self.i - 1] if self.i > 0 else 0
     def play(self, e):
         if self.playing: return
         if not self.loaded:
             if not self._parse(e): self.ev = []
             self.loaded = True
             self.i = next((k for k, x in enumerate(self.ev) if x[0] >= self.sec - 1e-9), len(self.ev))
-        self.t0 = e.n - int(self.sec * 108e6); self.playing = True
+        self.t0 = e.n - int(self.sec * IPS); self.playing = True
         if self.sec == 0:
-            ln = e.rd32(FW_GP + 0xFB4)
+            ln = e.rd32(FW_GP + self.LEN_GP) if self.LEN_GP is not None else 0
             self.length = ln / self.RATE if 0 < ln < 0x10000000 else 0.0
         self.pump(e)
     def stop(self, e):
@@ -1647,6 +1999,10 @@ class SongPlayer:
         self.pump(e)
     def seek(self, e, v):
         """The firmware sets the clock (0 before a new song): the file is read again at the next play."""
+        if self.playing and (v & 0xFFFF) == 0 and e.n - self.t0 < 0.25 * IPS:
+            # (Unikon) the clock is set to 0 just after the play command: the song has only just started, so it
+            # simply starts again from its beginning instead of being stopped
+            self.t0 = e.n; self.i = 0; self.lyric = 0; return
         if self.playing: self.stop(e)
         self.sec = (v & 0xFFFF) / self.RATE; self.loaded = False; self.i = 0
         self.pump(e)
@@ -1655,19 +2011,20 @@ class SongPlayer:
         if self.playing:
             now = e.n; ev = self.ev
             while self.i < len(ev):
-                n = self.t0 + int(ev[self.i][0] * 108e6)
+                n = self.t0 + int(ev[self.i][0] * IPS)
                 if n > now: break
                 if ev[self.i][1] is None: self.lyric += 1
                 else: self._send(e, ev[self.i][1], n)
                 self.i += 1
         if self.fast:        # the C core answers the firmware's (very frequent) reads from these registers
             R = e.mmio_regs
-            R[PB + 0x4F0] = int(self._sec(e) * self.RATE) & 0xFFFF
-            if e.low[(FW_GP + 0x101E) & 0x1FFFFFFF] != 1: R[PB + 0x4EC] = self.lyric & 0xFFFF    # (MP3 songs: KS5Ring)
+            R[PB + 0x4F0] = self._clock(e)
+            if self.av is not None: R[PB + 0x4EC] = self.av.value(e)
+            elif self.MP3_GP is None or e.low[(FW_GP + self.MP3_GP) & 0x1FFFFFFF] != 1: R[PB + 0x4EC] = self.lyric & 0xFFFF    # (MP3 songs: KS5Ring)
     def _sec(self, e):
         """Song time. The DSP's clock stops at the end of the file: the firmware sees it stand still and ends the
         song (0x8807DF0C), as on the real player."""
-        sec = (e.n - self.t0) / 108e6 if self.playing else self.sec
+        sec = (e.n - self.t0) / IPS if self.playing else self.sec
         if self.ev and self.i >= len(self.ev):
             # it runs on to the song length the firmware expects (gp+0xFB4 at the start, in clock units; files
             # can end with silence after the last note), then stops
@@ -1675,7 +2032,14 @@ class SongPlayer:
         return sec
     def position(self, e):
         self.pump(e)
-        return int(self._sec(e) * self.RATE)
+        return self._clock(e)
+    ZERO_AT_END = False      # K55: when the file has played out the DSP's MIDI player stops and its clock reads 0
+                             # (the firmware waits for 0 for 501 checks, 0x88017930, to end the song)
+    def _clock(self, e):
+        sec = self._sec(e)
+        if self.ZERO_AT_END and self.playing and self.ev and self.i >= len(self.ev):
+            if (e.n - self.t0) / IPS > sec + 1.0: return 0
+        return int(sec * self.RATE) & 0xFFFF
     def lyrics(self, e):
         self.pump(e); return self.lyric
     def set_lyrics(self, e, v):
@@ -1701,7 +2065,7 @@ class StreamDMA:
     NO_SCR = bool(__import__('os').environ.get('KE_NOSCR'))
     SEEK = float(__import__('os').environ.get('KE_SEEK', '0.08'))   # seconds for a jump of the drive's head
     STATE = 'stream_state'
-    POLL_N = 54_000        # 0.5 ms
+    POLL_N = int(IPS // 2000)  # 0.5 ms
     def __init__(self, emu, vd):
         self.e = emu; self.vd = vd; self.log = []; self.total = 0
         self.tap = bytearray(); self.tap_total = 0       # the sectors in delivery order, for a live decoder
@@ -1728,7 +2092,7 @@ class StreamDMA:
         # for data several times faster than real time, decided its reads had failed and began scanning the disc
         # (thousands of scattered reads per second, a broken picture and a slow emulator).
         seek = st['lba'] is not None and abs(lba - st['lba']) > 64
-        ahead = FW_ID == 'ks5' and st['lba'] is not None and st['lba'] <= lba <= st['lba'] + st['left'] + 16
+        ahead = FW_ID in DSP_FWS and st['lba'] is not None and st['lba'] <= lba <= st['lba'] + st['left'] + 16
         if st['lba'] is None or (lba != st['lba'] and not ahead): st['base'] = None     # a jump: restart the clock mapping
         # KS5: it asks for the next 4 sectors before the last ones have all arrived. Such a read continues the
         # stream: the stream clock is kept, so its sectors still come at playing speed (resetting it made the
@@ -1736,7 +2100,7 @@ class StreamDMA:
         st['lba'] = lba; st['left'] = n; st['q'] = b''
         # a real drive needs time to move its head: data for a far jump comes later (also keeps the firmware's
         # disc scans, a few per second on a real player, from turning into thousands of reads per second here)
-        st['wait_n'] = self.e.n + int(self.SEEK * 108e6) if seek else 0
+        st['wait_n'] = self.e.n + int(self.SEEK * IPS) if seek else 0
         if hasattr(self.e, 'fast_cache'): self.e.fast_cache(PB + 0x6110, 0, 0)     # new data: stop answering from cache
         self.log.append((self.e.n, lba, n)); del self.log[:-2000]
     @staticmethod
@@ -1744,6 +2108,21 @@ class StreamDMA:
         if sec[:4] != b'\x00\x00\x01\xba' or (sec[4] >> 6) != 1: return None
         b = sec
         return (((b[4] >> 3) & 7) << 30) | ((b[4] & 3) << 28) | (b[5] << 20) | ((b[6] >> 3) << 15) | ((b[6] & 3) << 13) | (b[7] << 5) | (b[8] >> 3)
+    # Light background video (Settings > performance, for slow PCs): the player's own demuxer gets the background
+    # video's picture packets as padding packets (same sizes, same clock), so the emulated CPU does not unpack
+    # ~1.4 MB/s of picture data that nothing here uses - the picture on screen is decoded from the disc directly.
+    LIGHT = bool(__import__('os').environ.get('KE_LIGHTBGV'))
+    @staticmethod
+    def _strip_video(sec):
+        if sec[:4] != b'\x00\x00\x01\xba': return sec
+        b = bytearray(sec)
+        p = 14 + (b[13] & 7) if (b[4] >> 6) == 1 else 12
+        while p + 6 <= 2048 and b[p:p + 3] == b'\x00\x00\x01':
+            sid = b[p + 3]; ln = (b[p + 4] << 8) | b[p + 5]
+            if 0xE0 <= sid <= 0xEF:
+                b[p + 3] = 0xBE; b[p + 6:p + 6 + ln] = b'\xff' * min(ln, 2048 - p - 6)
+            p += 6 + ln
+        return bytes(b)
     MV_LEAD = 1.0          # seconds of a music video the player may read ahead of its playing time
     def _mv_extents(self):
         """[(first sector, end sector, bytes per second)] of the disc's music videos (KARA125/MVV/*.mvv, AVI)."""
@@ -1780,7 +2159,7 @@ class StreamDMA:
         return None
     def _due(self, e, sec):
         """May this sector be delivered now?"""
-        st = self.st; now = e.n / 108e6
+        st = self.st; now = e.n / IPS
         mv = self._mv_of(st['lba']) if getattr(self.vd, 'disc', None) else None
         if mv is not None:
             # a music video (AVI): the player has no MPEG-4 decoder here to hold it back, so its reads are paced at
@@ -1791,7 +2170,7 @@ class StreamDMA:
             ahead = want - (now - p['t0'])
             if ahead > 30 or ahead < -5: p['t0'] = now - want; ahead = 0     # a jump (the index at the end, a seek)
             if ahead > self.MV_LEAD:
-                st['wait_n'] = e.n + int(min(ahead - self.MV_LEAD, 0.05) * 108e6); return False
+                st['wait_n'] = e.n + int(min(ahead - self.MV_LEAD, 0.05) * IPS); return False
             return True
         st.pop('mvp', None)
         s = self.scr(sec)
@@ -1800,12 +2179,12 @@ class StreamDMA:
         if base is None or t < base[1] - 0.5 or t > base[1] + (now - base[0]) + 5.0:
             st['base'] = base = (now, t)                   # first sector, or a clock discontinuity
         if t - base[1] > (now - base[0]) + self.LEAD and not self.NO_SCR:
-            st['wait_n'] = int((base[0] + (t - base[1]) - self.LEAD) * 108e6); return False
+            st['wait_n'] = int((base[0] + (t - base[1]) - self.LEAD) * IPS); return False
         # and never faster than a 1x DVD drive (some karaoke VOBs count their SCR up by 1 per pack at the start)
         cap = st.get('cap')
         if cap is None or now - cap[0] > 2.0: cap = st['cap'] = [now, 0]
         if cap[1] > (now - cap[0]) * self.MAX_RATE + 65536:
-            st['wait_n'] = e.n + 108000; return False
+            st['wait_n'] = e.n + IPMS_; return False
         if now - cap[0] > 1.0: cap[0] += 0.5; cap[1] = max(0, cap[1] - int(0.5 * self.MAX_RATE))
         cap[1] += 2048
         st['scr'] = t
@@ -1842,7 +2221,7 @@ class StreamDMA:
             if len(q) < 1024 and st['left'] and st['lba'] is not None:
                 sec = self.vd.src.read(st['lba'], 1)        # the 2048 user-data bytes (the DMA skips the sector header)
                 if not self._due(e, sec): break
-                lba = st['lba']; q += sec; st['lba'] += 1; st['left'] -= 1
+                lba = st['lba']; q += (self._strip_video(sec) if self.LIGHT else sec); st['lba'] += 1; st['left'] -= 1
                 # the live picture gets each disc sector once, in disc order: a sector the firmware reads again
                 # (stepping back a little) is left out, as a repeated stretch confuses the decoder
                 last = getattr(self, 'tap_lba', None)

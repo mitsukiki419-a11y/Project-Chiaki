@@ -1,0 +1,71 @@
+plugins {
+    id 'com.android.application'
+    id 'com.chaquo.python'
+}
+
+android {
+    namespace 'com.projectchiaki.app'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'com.projectchiaki.app'
+        minSdk 24
+        // 28 on purpose: an app that targets 29 or later may not run a program it copied itself (Android's
+        // "W^X" rule), and ffmpeg is not packed into the app - it is copied from the phone's Project Chiaki folder.
+        // A phone may say the app was "built for an older version of Android"; that is expected.
+        //noinspection ExpiredTargetSdkVersion
+        targetSdk 28
+        versionCode 2
+        versionName '1.0.0'
+        ndk { abiFilters 'arm64-v8a', 'x86_64' }   // ARM phones / tablets, and PC Android emulators (LDPlayer ...)
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.debug   // a personal build: signed with the debug key, install it directly
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    // the CPU core (libkecpu.so) must exist as a real file on the phone: Python opens it with ctypes
+    packaging { jniLibs { useLegacyPackaging true } }
+}
+
+// The emulator's Python files come straight from the Project Chiaki folder (the folder above this one), so the
+// phone app always has the same version as the Windows program.
+def chiakiDir = file("${rootDir}/..")
+def pyOut = layout.buildDirectory.dir("chiaki-python")
+tasks.register('syncChiakiPython', Copy) {
+    from(chiakiDir) {
+        include 'karaoke_emu.py', 'soc.py', 'emu.py', 'fwprofile.py', 'livesynth.py', 'isoread.py', 'descramble.py',
+                'karamidi.py', 'midiout.py', 'midiparse.py', 'mipsdis.py', 'mvlyrics.py', 'rig.py', 'run3.py',
+                'sf2synth.py', 'snapshot.py', 'songbank.py', 'songdisc.py', 'songlists.py', 'winperf.py'
+    }
+    into pyOut
+}
+preBuild.dependsOn 'syncChiakiPython'
+// Chaquopy's tasks read that folder: they must run after it is filled
+tasks.configureEach { t ->
+    if (t.name.contains('Python') && t.name != 'syncChiakiPython') t.dependsOn 'syncChiakiPython'
+}
+
+chaquopy {
+    defaultConfig {
+        version = '3.11'
+        // Python 3.11 on the PC (python.org): build_apk.bat passes its python.exe (-PchiakiPython=...)
+        def chiakiPy = project.findProperty('chiakiPython')
+        if (chiakiPy) buildPython chiakiPy.toString() else buildPython 'py', '-3.11'
+        pip {
+            install 'numpy'; install 'qrcode'
+            options '--timeout', '120'; options '--retries', '10'    // chaquo.com can be slow from some places
+        }
+    }
+    sourceSets {
+        getByName('main') { srcDir(pyOut.get().asFile.path) }
+    }
+}

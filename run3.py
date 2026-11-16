@@ -1,4 +1,4 @@
-import sys, json, struct; sys.path.insert(0,'/home/claude')
+import sys, json, struct
 from emu import Emu, Stop, load
 import soc
 from mipsdis import dis
@@ -43,7 +43,7 @@ def boot(max_total, patches, verbose=True):
 if __name__ == '__main__':
     budget = int(sys.argv[1]) if len(sys.argv) > 1 else 300_000_000
     max_patches = int(sys.argv[2]) if len(sys.argv) > 2 else 40
-    try: patches = {int(k): tuple(v) for k, v in json.load(open('/home/claude/autopatch.json')).items()}
+    try: patches = {int(k): tuple(v) for k, v in json.load(open('autopatch.json')).items()}
     except Exception: patches = {}
     e, u = boot(budget, patches)
     why = None
@@ -69,9 +69,9 @@ if __name__ == '__main__':
             e.read_hooks[p & ~3] = forced_hook(p & ~3, cm, sm)
             print(f'  auto-hook: reg {p & ~3:08x} mask {mask:#06x} -> loop wants bits {"CLEAR" if clear else "SET"}   (pc {e.cur_pc:08x}, instr #{e.n:,})')
             e.ring.clear()
-    json.dump({str(k): list(v) for k, v in patches.items()}, open('/home/claude/autopatch.json', 'w'))
+    json.dump({str(k): list(v) for k, v in patches.items()}, open('autopatch.json', 'w'))
     txt = bytes(u.out).decode('latin1').replace('\r', '')
-    open('/home/claude/uart.txt', 'w').write(txt)
+    open('uart.txt', 'w').write(txt)
     print(f'[{e.n:,} instrs] stop: {why}   pc={e.cur_pc:08x}')
     lines = [l for l in txt.split('\n') if l.strip()]
     print('UART lines:', len(lines), ' last 10:', lines[-10:])

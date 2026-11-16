@@ -1,0 +1,5 @@
+// Project Chiaki for Android. Open this "android" folder in Android Studio, then Build > Build APK(s).
+plugins {
+    id 'com.android.application' version '8.5.2' apply false
+    id 'com.chaquo.python' version '16.0.0' apply false
+}

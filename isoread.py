@@ -278,7 +278,7 @@ class SampleSource:
     def __init__(self, path):
         import json, zlib, bisect
         self.f = open(path, 'rb'); head = self.f.read(12)
-        if head[:8] != b'KEMUSPL1': raise DiscError('not a KaraokeEmu sample file')
+        if head[:8] != b'KEMUSPL1': raise DiscError('not a Project Chiaki (KaraokeEmu) sample file')
         n = struct.unpack('<I', head[8:12])[0]; self.index = json.loads(zlib.decompress(self.f.read(n)))
         self.data0 = 12 + n; self.total = self.index['total_sectors'] * 2048
         self.ss, self.off = 2048, 0
@@ -376,8 +376,17 @@ class Disc:
         node = self.lookup(path)
         if node.is_dir: raise DiscError('is a directory')
         if isinstance(self.fs, UDF):
-            data = self.fs._file_bytes(node)
-            for i in range(0, len(data), chunk): yield data[i:i + chunk]
+            # extent by extent, a chunk at a time (reading the whole file first made a multi-GB file take minutes)
+            left = node.size
+            for lba, ln in node.extents:
+                if left <= 0: break
+                ln = min(ln, left) if lba != 'embedded' else ln
+                if lba == 'embedded': b = ln[:left]; left -= len(b); yield b; continue
+                done = 0
+                while done < ln:
+                    n = min(ln - done, chunk)
+                    b = b'\x00' * n if lba is None else self.src.read(lba + done // 2048, (n + 2047) // 2048)[:n]
+                    done += n; left -= len(b); yield b
             return
         remaining_total = node.size
         for lba, ln in node.extents:
@@ -394,6 +403,25 @@ class Disc:
                 done += n
 
     def read(self, path, offset=0, length=None, raw_xa=False):
+        node = self.lookup(path)
+        if node.is_dir: raise DiscError('is a directory')
+        if not (raw_xa and self.src.is_xa):
+            # straight to the sectors that hold [offset, offset+length): no reading from the start of the file
+            end = node.size if length is None else min(node.size, offset + length)
+            out, pos = [], 0
+            for lba, ln in node.extents:
+                if pos >= end: break
+                if lba == 'embedded': seg = ln[:node.size]; ln = len(seg)
+                a, b = max(offset, pos), min(end, pos + ln)
+                if a < b:
+                    o = a - pos
+                    if lba == 'embedded': out.append(seg[o:o + (b - a)])
+                    elif lba is None: out.append(b'\x00' * (b - a))
+                    else:
+                        s0 = o // 2048; s1 = (o + (b - a) + 2047) // 2048
+                        out.append(self.src.read(lba + s0, s1 - s0)[o - s0 * 2048: o - s0 * 2048 + (b - a)])
+                pos += ln
+            return b''.join(out)
         out, pos = [], 0
         for c in self.iter_chunks(path, raw_xa=raw_xa):
             end = pos + len(c)
@@ -498,6 +526,8 @@ class Disc:
 
 
 def find_ffmpeg():
+    env = os.environ.get('KE_FFMPEG')                # Android: the app's own ffmpeg (in its native library folder)
+    if env and os.path.isfile(env): return env
     here = os.path.dirname(sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(__file__))
     dirs = [here, os.getcwd()]
     if getattr(sys, '_MEIPASS', None): dirs.insert(0, sys._MEIPASS)        # ffmpeg bundled with --add-binary

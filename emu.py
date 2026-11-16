@@ -324,6 +324,7 @@ def _load_lib():
     dirs = [here]
     if getattr(sys, '_MEIPASS', None): dirs.insert(0, sys._MEIPASS)
     if getattr(sys, 'frozen', False): dirs.append(_os.path.dirname(sys.executable))
+    if _os.environ.get('KE_LIBDIR'): dirs.insert(0, _os.environ['KE_LIBDIR'])     # Android: the app's native library folder
     names = ('kecpu.dll',) if _os.name == 'nt' else ('libkecpu.so',)
     for d in dirs:
         for nm in names:
@@ -629,7 +630,7 @@ class FastEmu(PyEmu):
 Emu = FastEmu if _load_lib() else PyEmu
 
 
-def load(path='/home/claude/MP100NSP.dec.bin'):
+def load(path='MP100NSP.dec.bin'):
     return open(path, 'rb').read()
 
 if __name__ == '__main__':
